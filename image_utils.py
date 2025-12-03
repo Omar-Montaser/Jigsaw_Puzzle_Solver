@@ -3,20 +3,19 @@ import numpy as np
 from PIL import Image
 
 def load_image(image_path):
-    """Loads an image from the specified path."""
+    """Load image and convert to numpy array."""
     try:
         img = Image.open(image_path)
         return np.array(img)
     except Exception as e:
-        print(f"Error loading image: {e}")
         return None
 
 def detect_grid_size(image_path):
+    """Detect puzzle grid size (2x2, 4x4, or 8x8) using gradient analysis."""
     img = load_image(image_path)
     if img is None:
         return None
         
-    # Convert to grayscale
     if len(img.shape) == 3:
         gray = np.mean(img, axis=2)
     else:
@@ -24,11 +23,9 @@ def detect_grid_size(image_path):
         
     h, w = gray.shape
     
-    # Compute gradients (absolute difference)
     grad_y = np.abs(np.diff(gray, axis=0))
     grad_x = np.abs(np.diff(gray, axis=1))
     
-    # Project to 1D profiles
     row_profile = np.mean(grad_y, axis=1)
     col_profile = np.mean(grad_x, axis=0)
     
@@ -79,25 +76,20 @@ def detect_grid_size(image_path):
     if score_2_y > THRESHOLD and score_2_x > THRESHOLD:
         return 2
         
-    print("Could not confidently detect grid size from content. Returning None.")
     return None
 
 def split_image(image_array, grid_size):
-    """Splits the image into grid_size x grid_size patches."""
+    """Split image into grid_size x grid_size patches."""
     if image_array is None:
         return []
         
     height, width = image_array.shape[:2]
-    
-    # Calculate patch size
     patch_height = height // grid_size
     patch_width = width // grid_size
     
     patches = []
-    
     for i in range(grid_size):
         for j in range(grid_size):
-            # Extract patch
             y_start = i * patch_height
             y_end = (i + 1) * patch_height
             x_start = j * patch_width
