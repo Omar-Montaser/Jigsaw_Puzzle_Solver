@@ -12,15 +12,6 @@ def load_image(image_path):
         return None
 
 def detect_grid_size(image_path):
-    """
-    Detects the grid size (2, 4, or 8) based on image content (gradients).
-    
-    Args:
-        image_path: String path to the image.
-        
-    Returns:
-        Integer grid size (2, 4, or 8) or None if not found.
-    """
     img = load_image(image_path)
     if img is None:
         return None
@@ -92,16 +83,7 @@ def detect_grid_size(image_path):
     return None
 
 def split_image(image_array, grid_size):
-    """
-    Splits the image into grid_size x grid_size patches.
-    
-    Args:
-        image_array: numpy array of the image.
-        grid_size: integer, number of patches per row/col (e.g., 2, 4, 8).
-        
-    Returns:
-        List of image patches.
-    """
+    """Splits the image into grid_size x grid_size patches."""
     if image_array is None:
         return []
         
@@ -127,20 +109,12 @@ def split_image(image_array, grid_size):
     return patches
 
 def display_patches_with_indices(patches, grid_size):
-    """
-    Displays patches in a grid with their indices.
-    
-    Args:
-        patches: List of image patches.
-        grid_size: integer, number of patches per row/col.
-    """
     if not patches:
         print("No patches to display.")
         return
 
     fig, axes = plt.subplots(grid_size, grid_size, figsize=(12, 12))
     
-    # Flatten axes array for easy iteration if it's multidimensional
     if grid_size > 1:
         axes = axes.flatten()
     else:

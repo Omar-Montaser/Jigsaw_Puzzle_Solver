@@ -1,0 +1,21 @@
+{
+  "total_images_processed": 321,
+  "results_by_type": {
+    "puzzle_2x2": 101,
+    "puzzle_4x4": 110,
+    "puzzle_8x8": 110
+  },
+  "processing_parameters": {
+    "gaussian_kernel_size": [
+      5,
+      5
+    ],
+    "canny_low": 50,
+    "canny_high": 150,
+    "clahe_clip_limit": 2.0,
+    "clahe_tile_size": [
+      8,
+      8
+    ]
+  }
+}
