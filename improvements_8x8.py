@@ -79,6 +79,32 @@ class SolverConfig:
 # PHASE 0: DESCRIPTOR COMPUTATION
 # =============================================================================
 
+def border_likelihood(edge_strip: np.ndarray) -> float:
+    """
+    Compute how likely an edge is to be a TRUE puzzle border (not internal edge).
+    True borders have LOW gradient variance (smooth/uniform outside the puzzle).
+    Returns variance of gradients - LOWER = more likely to be true border.
+    """
+    if edge_strip is None or edge_strip.size == 0:
+        return 1.0  # High value = not a border
+    
+    # Convert to grayscale if needed
+    if len(edge_strip.shape) == 3:
+        gray = cv2.cvtColor(edge_strip, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = edge_strip.copy()
+    
+    # Compute gradients
+    gray = gray.astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    g = np.abs(gx) + np.abs(gy)
+    
+    # Return variance of gradient magnitude
+    # Low variance = uniform edge = likely true border
+    return float(np.var(g))
+
+
 class EdgeDescriptors:
     """Precomputed descriptors for a single edge."""
     
@@ -92,6 +118,26 @@ class EdgeDescriptors:
         self.lbp_hist = self._compute_lbp_hist(strip, config.lbp_bins)
         self.curvature = self._compute_curvature(strip, config.resample_len)
         self.centroid_radial = self._compute_centroid_radial(strip, config.resample_len)
+        
+        # Compute border likelihood (how likely this edge is a TRUE puzzle border)
+        # Uses a 5-pixel strip at the edge boundary
+        border_strip = self._get_border_strip(piece, edge, width=5)
+        self.border_likelihood = border_likelihood(border_strip)
+    
+    def _get_border_strip(self, piece: np.ndarray, edge: str, width: int = 5) -> np.ndarray:
+        """Get a strip at the very edge of the piece for border detection."""
+        h, w = piece.shape[:2]
+        width = min(width, h, w)  # Don't exceed piece dimensions
+        
+        if edge == 'top':
+            return piece[:width, :, :] if len(piece.shape) == 3 else piece[:width, :]
+        elif edge == 'bottom':
+            return piece[-width:, :, :] if len(piece.shape) == 3 else piece[-width:, :]
+        elif edge == 'left':
+            return piece[:, :width, :] if len(piece.shape) == 3 else piece[:, :width]
+        elif edge == 'right':
+            return piece[:, -width:, :] if len(piece.shape) == 3 else piece[:, -width:]
+        return None
     
     def _get_strip(self, piece: np.ndarray, edge: str, width: int) -> np.ndarray:
         # IMPORTANT ORIENTATION RULE:
@@ -237,10 +283,14 @@ class CompatibilityMatrix:
     Precomputed compatibility scores between all edge pairs.
     """
     
+    # Border penalty weight - higher = stronger enforcement of true borders
+    BORDER_PENALTY_WEIGHT = 0.005
+    
     def __init__(self, pieces: Dict[int, np.ndarray], config: SolverConfig):
         self.config = config
         self.piece_ids = sorted(pieces.keys())
         self.n_pieces = len(self.piece_ids)
+        self.grid_size = int(np.sqrt(self.n_pieces))
         self.edges = ['top', 'bottom', 'left', 'right']
         self.complementary = {'top': 'bottom', 'bottom': 'top', 'left': 'right', 'right': 'left'}
         
@@ -250,6 +300,9 @@ class CompatibilityMatrix:
         for pid in self.piece_ids:
             for edge in self.edges:
                 self.descriptors[(pid, edge)] = EdgeDescriptors(pieces[pid], edge, config)
+        
+        # Normalize border likelihoods to [0, 1] range
+        self._normalize_border_likelihoods()
         
         # Compute all compatibilities
         print("  Computing pairwise compatibility...")
@@ -262,6 +315,69 @@ class CompatibilityMatrix:
         # second_best_match[(pid, edge)] = (pid, edge, score)
         self.second_best: Dict[Tuple[int, str], Tuple[int, str, float]] = {}
         
+    def _normalize_border_likelihoods(self):
+        """Normalize border likelihood values to [0, 1] range."""
+        all_likelihoods = [self.descriptors[(pid, edge)].border_likelihood 
+                          for pid in self.piece_ids for edge in self.edges]
+        
+        min_val = min(all_likelihoods)
+        max_val = max(all_likelihoods)
+        range_val = max_val - min_val if max_val > min_val else 1.0
+        
+        # Normalize: low original value -> low normalized value -> more likely to be border
+        for pid in self.piece_ids:
+            for edge in self.edges:
+                desc = self.descriptors[(pid, edge)]
+                desc.border_likelihood_normalized = (desc.border_likelihood - min_val) / range_val
+        
+        print(f"  Border likelihood range: [{min_val:.2f}, {max_val:.2f}]")
+    
+    def get_border_penalty(self, pid: int, row: int, col: int) -> float:
+        """
+        Compute border penalty for placing piece pid at position (row, col).
+        Pieces on the border should have LOW border_likelihood (smooth edges).
+        If a piece with HIGH border_likelihood is placed on border, add penalty.
+        If a piece with LOW border_likelihood is NOT on border, add penalty.
+        """
+        gs = self.grid_size
+        penalty = 0.0
+        weight = self.BORDER_PENALTY_WEIGHT
+        
+        # Check each edge
+        # TOP edge of puzzle (row == 0): piece's top edge should be border-like (low likelihood)
+        if row == 0:
+            top_likelihood = self.descriptors[(pid, 'top')].border_likelihood_normalized
+            penalty += weight * top_likelihood  # Penalize high likelihood on border
+        else:
+            # NOT on top border - penalize if this edge looks like a border (should be internal)
+            top_likelihood = self.descriptors[(pid, 'top')].border_likelihood_normalized
+            penalty += weight * (1.0 - top_likelihood) * 0.5  # Mild penalty for border-like internal edges
+        
+        # BOTTOM edge of puzzle (row == gs-1)
+        if row == gs - 1:
+            bottom_likelihood = self.descriptors[(pid, 'bottom')].border_likelihood_normalized
+            penalty += weight * bottom_likelihood
+        else:
+            bottom_likelihood = self.descriptors[(pid, 'bottom')].border_likelihood_normalized
+            penalty += weight * (1.0 - bottom_likelihood) * 0.5
+        
+        # LEFT edge of puzzle (col == 0)
+        if col == 0:
+            left_likelihood = self.descriptors[(pid, 'left')].border_likelihood_normalized
+            penalty += weight * left_likelihood
+        else:
+            left_likelihood = self.descriptors[(pid, 'left')].border_likelihood_normalized
+            penalty += weight * (1.0 - left_likelihood) * 0.5
+        
+        # RIGHT edge of puzzle (col == gs-1)
+        if col == gs - 1:
+            right_likelihood = self.descriptors[(pid, 'right')].border_likelihood_normalized
+            penalty += weight * right_likelihood
+        else:
+            right_likelihood = self.descriptors[(pid, 'right')].border_likelihood_normalized
+            penalty += weight * (1.0 - right_likelihood) * 0.5
+        
+        return penalty
         self._compute_all()
     
     def _chi_squared(self, h1: np.ndarray, h2: np.ndarray) -> float:
@@ -522,18 +638,22 @@ class PuzzleAssembler:
         self.board: Dict[Tuple[int, int], int] = {}
     
     def evaluate_board(self, board: Optional[Dict] = None) -> float:
-        """Compute average edge score for current board."""
+        """Compute average edge score + border penalties for current board."""
         if board is None:
             board = self.board
         
         total = 0.0
         count = 0
+        border_penalty_total = 0.0
         
         for row in range(self.grid_size):
             for col in range(self.grid_size):
                 if (row, col) not in board:
                     continue
                 pid = board[(row, col)]
+                
+                # Add border penalty for this piece at this position
+                border_penalty_total += self.compat.get_border_penalty(pid, row, col)
                 
                 # Right neighbor
                 if col < self.grid_size - 1 and (row, col + 1) in board:
@@ -547,7 +667,8 @@ class PuzzleAssembler:
                     total += self.compat.get_vertical_score(pid, bottom_pid)
                     count += 1
         
-        return total / max(count, 1)
+        seam_score = total / max(count, 1)
+        return seam_score + border_penalty_total
     
     def assemble_beam_search(self, beam_width: int = 10000) -> Dict[Tuple[int, int], int]:
         """Beam search assembly."""
@@ -773,16 +894,20 @@ class PuzzleRefiner:
         self.config = config
     
     def evaluate(self, board: Dict[Tuple[int, int], int]) -> float:
-        """Compute board score."""
+        """Compute board score including border penalties."""
         total = 0.0
         count = 0
         gs = self.grid_size
+        border_penalty_total = 0.0
         
         for row in range(gs):
             for col in range(gs):
                 pid = board.get((row, col))
                 if pid is None:
                     continue
+                
+                # Add border penalty for this piece at this position
+                border_penalty_total += self.compat.get_border_penalty(pid, row, col)
                 
                 if col < gs - 1:
                     right = board.get((row, col + 1))
@@ -796,15 +921,18 @@ class PuzzleRefiner:
                         total += self.compat.get_vertical_score(pid, bottom)
                         count += 1
         
-        return total / max(count, 1)
+        seam_score = total / max(count, 1)
+        return seam_score + border_penalty_total
 
     def _total_edge_sum(self, board: Dict[Tuple[int, int], int]) -> float:
-        """Sum of all neighbor edge scores for a FULL board."""
+        """Sum of all neighbor edge scores + border penalties for a FULL board."""
         total = 0.0
         gs = self.grid_size
         for r in range(gs):
             for c in range(gs):
                 pid = board[(r, c)]
+                # Add border penalty
+                total += self.compat.get_border_penalty(pid, r, c)
                 if c < gs - 1:
                     total += self.compat.get_horizontal_score(pid, board[(r, c + 1)])
                 if r < gs - 1:
@@ -840,6 +968,18 @@ class PuzzleRefiner:
 
         old_sum = 0.0
         new_sum = 0.0
+        
+        # Border penalty delta: only positions a and b change their pieces
+        ra, ca = a
+        rb, cb = b
+        pid_a_old = board[a]
+        pid_b_old = board[b]
+        # After swap: position a has pid_b_old, position b has pid_a_old
+        old_sum += self.compat.get_border_penalty(pid_a_old, ra, ca)
+        old_sum += self.compat.get_border_penalty(pid_b_old, rb, cb)
+        new_sum += self.compat.get_border_penalty(pid_b_old, ra, ca)  # pid_b now at position a
+        new_sum += self.compat.get_border_penalty(pid_a_old, rb, cb)  # pid_a now at position b
+        
         for (p1, p2) in affected:
             (r1, c1), (r2, c2) = p1, p2
             pid1_old = board[(r1, c1)]
@@ -1117,6 +1257,200 @@ class AmbiguityClusterRefiner:
                 best_board = shifted
         return best_board
 
+    def _try_all_cyclic_shifts(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Try all combinations of global cyclic row and column shifts.
+        This fixes cases where the entire puzzle is shifted by N columns or M rows.
+        """
+        gs = self.grid_size
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        # Try all column shifts (0 to gs-1)
+        for col_shift in range(gs):
+            # Try all row shifts (0 to gs-1)
+            for row_shift in range(gs):
+                if col_shift == 0 and row_shift == 0:
+                    continue
+                
+                shifted = {}
+                for r in range(gs):
+                    for c in range(gs):
+                        new_r = (r + row_shift) % gs
+                        new_c = (c + col_shift) % gs
+                        shifted[(new_r, new_c)] = board[(r, c)]
+                
+                score = self.evaluate(shifted)
+                if score < best_score - 1e-9:
+                    best_score = score
+                    best_board = shifted
+                    print(f"        Cyclic shift (row={row_shift}, col={col_shift}) improved: {best_score:.4f}")
+        
+        return best_board
+
+    def _try_row_cyclic_shifts(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Try cyclic shifts for individual rows to fix row misalignment.
+        This fixes cases where rows are internally correct but shifted relative to each other.
+        """
+        gs = self.grid_size
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        improved = True
+        while improved:
+            improved = False
+            for row in range(gs):
+                for shift in range(1, gs):
+                    candidate = dict(best_board)
+                    # Shift this row by 'shift' positions
+                    for c in range(gs):
+                        candidate[(row, (c + shift) % gs)] = best_board[(row, c)]
+                    
+                    score = self.evaluate(candidate)
+                    if score < best_score - 1e-9:
+                        best_score = score
+                        best_board = candidate
+                        improved = True
+                        print(f"        Row {row} shift by {shift} improved: {best_score:.4f}")
+        
+        return best_board
+
+    def _try_column_block_shifts(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Try shifting blocks of columns (e.g., last 3 columns become first 3).
+        This addresses the specific issue where column groups are misplaced.
+        """
+        gs = self.grid_size
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        # Try all possible column reorderings by shifting blocks
+        for shift in range(1, gs):
+            # Shift all columns: column c becomes column (c + shift) % gs
+            candidate = {}
+            for r in range(gs):
+                for c in range(gs):
+                    new_c = (c + shift) % gs
+                    candidate[(r, new_c)] = board[(r, c)]
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
+                print(f"        Column block shift by {shift} improved: {best_score:.4f}")
+        
+        return best_board
+
+    def _try_all_row_shift_combinations(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Try all combinations of row shifts to find the globally optimal alignment.
+        For 8 rows with 8 possible shifts each, this is 8^8 = 16M combinations, which is too many.
+        Instead, we use a greedy approach: fix one row and find best shifts for others.
+        """
+        from itertools import product
+        
+        gs = self.grid_size
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        # Fix row 0 and try all shifts for other rows
+        # For each row, try all 8 shifts and pick the best relative to fixed rows
+        for anchor_shift in range(gs):
+            candidate = dict(board)
+            
+            # Shift all rows by anchor_shift first
+            for r in range(gs):
+                for c in range(gs):
+                    candidate[(r, (c + anchor_shift) % gs)] = board[(r, c)]
+            
+            # Now greedily adjust each row
+            for row in range(1, gs):
+                row_best_shift = 0
+                row_best_score = self.evaluate(candidate)
+                
+                for shift in range(1, gs):
+                    test = dict(candidate)
+                    for c in range(gs):
+                        test[(row, (c + shift) % gs)] = candidate[(row, c)]
+                    
+                    score = self.evaluate(test)
+                    if score < row_best_score - 1e-9:
+                        row_best_score = score
+                        row_best_shift = shift
+                
+                if row_best_shift != 0:
+                    new_candidate = dict(candidate)
+                    for c in range(gs):
+                        new_candidate[(row, (c + row_best_shift) % gs)] = candidate[(row, c)]
+                    candidate = new_candidate
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
+                print(f"        Global row alignment (anchor={anchor_shift}) improved: {best_score:.4f}")
+        
+        return best_board
+
+    def _try_column_reordering_by_vertical_fit(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Try reordering columns to maximize vertical edge fit.
+        Build columns one at a time using best vertical compatibility.
+        """
+        gs = self.grid_size
+        
+        # Extract columns
+        columns = []
+        for c in range(gs):
+            col = tuple(board[(r, c)] for r in range(gs))
+            columns.append(col)
+        
+        # Calculate vertical cost of putting col_a left of col_b
+        def col_vertical_cost(col_a, col_b):
+            # This is actually horizontal cost - col_a's right edges match col_b's left edges
+            cost = 0.0
+            for r in range(gs):
+                cost += self.compat.get_horizontal_score(col_a[r], col_b[r])
+            return cost / gs
+        
+        # Find best ordering of columns using beam search
+        beam_width = 1000
+        beam = [(tuple([0]), frozenset([0]), 0.0)]  # Start with column 0
+        
+        for _ in range(1, gs):
+            new_beam = []
+            for order, used, cum_cost in beam:
+                for c in range(gs):
+                    if c in used:
+                        continue
+                    # Cost of adding column c after the last column in order
+                    add_cost = col_vertical_cost(columns[order[-1]], columns[c])
+                    new_beam.append((order + (c,), used | {c}, cum_cost + add_cost))
+            
+            new_beam.sort(key=lambda x: x[2])
+            beam = new_beam[:beam_width]
+        
+        if not beam:
+            return board
+        
+        best_order = beam[0][0]
+        
+        # Build new board with this column order
+        new_board = {}
+        for new_c, orig_c in enumerate(best_order):
+            for r in range(gs):
+                new_board[(r, new_c)] = columns[orig_c][r]
+        
+        new_score = self.evaluate(new_board)
+        old_score = self.evaluate(board)
+        
+        if new_score < old_score - 1e-9:
+            print(f"        Column reorder improved: {old_score:.4f} -> {new_score:.4f}")
+            return new_board
+        
+        return board
+
     def _final_global_swap_refinement(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
         """
         Try all possible pairwise swaps (not just adjacent) and accept any that improve the score.
@@ -1160,16 +1494,21 @@ class AmbiguityClusterRefiner:
         self.max_total_permutations = 100000  # Global limit on search space
     
     def evaluate(self, board: Dict[Tuple[int, int], int]) -> float:
-        """Compute board score (lower = better)."""
+        """Compute board score including border penalties (lower = better)."""
         total = 0.0
         count = 0
         gs = self.grid_size
+        border_penalty_total = 0.0
         
         for r in range(gs):
             for c in range(gs):
                 pid = board.get((r, c))
                 if pid is None:
                     continue
+                
+                # Add border penalty for this piece at this position
+                border_penalty_total += self.compat.get_border_penalty(pid, r, c)
+                
                 if c < gs - 1:
                     right = board.get((r, c + 1))
                     if right is not None:
@@ -1181,7 +1520,8 @@ class AmbiguityClusterRefiner:
                         total += self.compat.get_vertical_score(pid, bottom)
                         count += 1
         
-        return total / max(count, 1)
+        seam_score = total / max(count, 1)
+        return seam_score + border_penalty_total
     
     def _get_edge_margins(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], float]:
         """
@@ -1821,6 +2161,10 @@ class AmbiguityClusterRefiner:
         initial_score = self.evaluate(board)
         print(f"    Initial score: {initial_score:.4f}")
         
+        # Step 0: Try all cyclic column and row shifts FIRST (fixes global misalignment)
+        print("    Trying global cyclic shifts...")
+        board = self._try_all_cyclic_shifts(board)
+        
         # Step 0a: Try 2D global construction (uses both H and V from start)
         board = self._try_2d_global_construction(board)
         
@@ -1883,6 +2227,22 @@ class AmbiguityClusterRefiner:
         board = self._try_full_row_permutations(board)
         board = self._try_full_column_permutations(board)
         
+        # Step 5b: Try row cyclic shifts (fixes row misalignment)
+        print("    Trying row cyclic shifts...")
+        board = self._try_row_cyclic_shifts(board)
+        
+        # Step 5c: Try column block shifts
+        print("    Trying column block shifts...")
+        board = self._try_column_block_shifts(board)
+        
+        # Step 5d: Try all row shift combinations
+        print("    Trying global row alignment...")
+        board = self._try_all_row_shift_combinations(board)
+        
+        # Step 5e: Try column reordering by vertical fit
+        print("    Trying column reordering...")
+        board = self._try_column_reordering_by_vertical_fit(board)
+        
         # Step 6/7: Alternate global swap and column shift correction until convergence
         print("    Alternating global swap and column shift correction...")
         prev_score = self.evaluate(board)
@@ -1897,6 +2257,10 @@ class AmbiguityClusterRefiner:
             after = self.evaluate(board)
             if after < before - 1e-6:
                 print(f"      Column shift improved: {before:.4f} -> {after:.4f}")
+            # Also try row cyclic shifts
+            before = after
+            board = self._try_row_cyclic_shifts(board)
+            after = self.evaluate(board)
             if abs(after - prev_score) < 1e-9:
                 break
             prev_score = after
@@ -1909,7 +2273,749 @@ class AmbiguityClusterRefiner:
         else:
             print(f"    No improvement found")
 
+        # Step 8: Boundary-specific refinement (fixes first/last col, last row issues)
+        print("    Boundary-specific refinement...")
+        board = self._fix_boundary_pieces(board)
+        
+        # Step 9: Try rebuilding boundary rows/columns using interior as anchor
+        print("    Rebuilding boundary from interior anchor...")
+        board = self._rebuild_boundary_from_interior(board)
+        
+        # Step 10: Try swapping pairs of adjacent pieces (fixes 2-piece group swaps)
+        print("    Trying pair swaps...")
+        board = self._try_pair_swaps(board)
+        
+        # Step 11: Iterate boundary fix and rebuild until no improvement
+        prev_score = self.evaluate(board)
+        for iteration in range(5):
+            print(f"    Boundary iteration {iteration + 1}...")
+            board = self._fix_boundary_pieces(board)
+            board = self._rebuild_boundary_from_interior(board)
+            board = self._try_pair_swaps(board)
+            board = self._final_global_swap_refinement(board)
+            new_score = self.evaluate(board)
+            if new_score >= prev_score - 1e-9:
+                break
+            print(f"      Iteration improved: {prev_score:.4f} -> {new_score:.4f}")
+            prev_score = new_score
+        
+        # Final pass
+        board = self._final_global_swap_refinement(board)
+        
         return board
+
+    def _try_pair_swaps(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Try swapping pairs of adjacent pieces with other pairs.
+        This fixes cases where two correctly-grouped pieces need to swap
+        positions with another correctly-grouped pair.
+        """
+        gs = self.grid_size
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        # Generate all horizontal pairs (two horizontally adjacent pieces)
+        h_pairs = []
+        for r in range(gs):
+            for c in range(gs - 1):
+                h_pairs.append(((r, c), (r, c + 1)))
+        
+        # Generate all vertical pairs
+        v_pairs = []
+        for r in range(gs - 1):
+            for c in range(gs):
+                v_pairs.append(((r, c), (r + 1, c)))
+        
+        all_pairs = h_pairs + v_pairs
+        
+        improved = True
+        iterations = 0
+        while improved and iterations < 3:
+            improved = False
+            iterations += 1
+            
+            # Try swapping each pair with every other pair
+            for i, pair1 in enumerate(all_pairs):
+                for j, pair2 in enumerate(all_pairs):
+                    if i >= j:
+                        continue
+                    
+                    # Check if pairs overlap
+                    pos1a, pos1b = pair1
+                    pos2a, pos2b = pair2
+                    if len({pos1a, pos1b, pos2a, pos2b}) < 4:
+                        continue  # Pairs overlap, skip
+                    
+                    # Try swapping the pairs
+                    candidate = dict(best_board)
+                    # Swap piece at pos1a with piece at pos2a
+                    # Swap piece at pos1b with piece at pos2b
+                    candidate[pos1a], candidate[pos2a] = candidate[pos2a], candidate[pos1a]
+                    candidate[pos1b], candidate[pos2b] = candidate[pos2b], candidate[pos1b]
+                    
+                    score = self.evaluate(candidate)
+                    if score < best_score - 1e-9:
+                        best_score = score
+                        best_board = candidate
+                        improved = True
+                        print(f"        Pair swap improved: {self.evaluate(board):.4f} -> {best_score:.4f}")
+        
+        return best_board
+
+    def _rebuild_boundary_from_interior(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Rebuild each boundary row/column using the adjacent interior as a constraint.
+        Uses beam search to find the best piece sequence for each boundary.
+        """
+        gs = self.grid_size
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        # Get interior pieces (1 to gs-2 in both dimensions)
+        interior_positions = set((r, c) for r in range(1, gs-1) for c in range(1, gs-1))
+        interior_pieces = set(board[pos] for pos in interior_positions)
+        
+        # Boundary pieces are everything else
+        boundary_pieces = [pid for pid in range(64) if pid not in interior_pieces]
+        
+        # Try rebuilding first row using row 1 as anchor
+        print("        Rebuilding first row...")
+        first_row_board = self._rebuild_row_from_anchor(best_board, 0, 1, boundary_pieces)
+        first_row_score = self.evaluate(first_row_board)
+        if first_row_score < best_score - 1e-9:
+            best_score = first_row_score
+            best_board = first_row_board
+            print(f"          First row improved: {self.evaluate(board):.4f} -> {best_score:.4f}")
+        
+        # Try rebuilding last row using row gs-2 as anchor
+        print("        Rebuilding last row...")
+        last_row_board = self._rebuild_row_from_anchor(best_board, gs-1, gs-2, boundary_pieces)
+        last_row_score = self.evaluate(last_row_board)
+        if last_row_score < best_score - 1e-9:
+            best_score = last_row_score
+            best_board = last_row_board
+            print(f"          Last row improved: {best_score:.4f}")
+        
+        # Try rebuilding first column using column 1 as anchor
+        print("        Rebuilding first column...")
+        first_col_board = self._rebuild_col_from_anchor(best_board, 0, 1, boundary_pieces)
+        first_col_score = self.evaluate(first_col_board)
+        if first_col_score < best_score - 1e-9:
+            best_score = first_col_score
+            best_board = first_col_board
+            print(f"          First col improved: {best_score:.4f}")
+        
+        # Try rebuilding last column using column gs-2 as anchor
+        print("        Rebuilding last column...")
+        last_col_board = self._rebuild_col_from_anchor(best_board, gs-1, gs-2, boundary_pieces)
+        last_col_score = self.evaluate(last_col_board)
+        if last_col_score < best_score - 1e-9:
+            best_score = last_col_score
+            best_board = last_col_board
+            print(f"          Last col improved: {best_score:.4f}")
+        
+        return best_board
+    
+    def _rebuild_row_from_anchor(self, board: Dict[Tuple[int, int], int], 
+                                  target_row: int, anchor_row: int,
+                                  available_pieces: List[int]) -> Dict[Tuple[int, int], int]:
+        """Rebuild a row using the adjacent anchor row as a constraint."""
+        gs = self.grid_size
+        
+        # Get pieces currently in target row
+        target_pieces = set(board[(target_row, c)] for c in range(gs))
+        
+        # Get anchor row pieces
+        anchor_pieces = [board[(anchor_row, c)] for c in range(gs)]
+        
+        # Use beam search to find best assignment
+        beam_width = 1000
+        
+        # State: (row_so_far, used_pieces, score)
+        initial = (tuple(), frozenset(), 0.0)
+        beam = [initial]
+        
+        for col in range(gs):
+            anchor_pid = anchor_pieces[col]
+            new_beam = []
+            
+            for row_so_far, used, cum_score in beam:
+                for pid in target_pieces:
+                    if pid in used:
+                        continue
+                    
+                    # Score this placement
+                    score = 0.0
+                    count = 0
+                    
+                    # Vertical score with anchor
+                    if target_row < anchor_row:
+                        score += self.compat.get_vertical_score(pid, anchor_pid)
+                    else:
+                        score += self.compat.get_vertical_score(anchor_pid, pid)
+                    count += 1
+                    
+                    # Horizontal score with previous piece in row
+                    if col > 0:
+                        prev_pid = row_so_far[-1]
+                        score += self.compat.get_horizontal_score(prev_pid, pid)
+                        count += 1
+                    
+                    avg_score = score / count
+                    new_beam.append((row_so_far + (pid,), used | {pid}, cum_score + avg_score))
+            
+            # Keep top beam_width
+            new_beam.sort(key=lambda x: x[2])
+            beam = new_beam[:beam_width]
+        
+        if not beam:
+            return board
+        
+        # Build new board
+        best_row = beam[0][0]
+        new_board = dict(board)
+        for c, pid in enumerate(best_row):
+            new_board[(target_row, c)] = pid
+        
+        return new_board
+    
+    def _rebuild_col_from_anchor(self, board: Dict[Tuple[int, int], int],
+                                  target_col: int, anchor_col: int,
+                                  available_pieces: List[int]) -> Dict[Tuple[int, int], int]:
+        """Rebuild a column using the adjacent anchor column as a constraint."""
+        gs = self.grid_size
+        
+        # Get pieces currently in target column
+        target_pieces = set(board[(r, target_col)] for r in range(gs))
+        
+        # Get anchor column pieces
+        anchor_pieces = [board[(r, anchor_col)] for r in range(gs)]
+        
+        # Use beam search
+        beam_width = 1000
+        
+        initial = (tuple(), frozenset(), 0.0)
+        beam = [initial]
+        
+        for row in range(gs):
+            anchor_pid = anchor_pieces[row]
+            new_beam = []
+            
+            for col_so_far, used, cum_score in beam:
+                for pid in target_pieces:
+                    if pid in used:
+                        continue
+                    
+                    score = 0.0
+                    count = 0
+                    
+                    # Horizontal score with anchor
+                    if target_col < anchor_col:
+                        score += self.compat.get_horizontal_score(pid, anchor_pid)
+                    else:
+                        score += self.compat.get_horizontal_score(anchor_pid, pid)
+                    count += 1
+                    
+                    # Vertical score with previous piece in column
+                    if row > 0:
+                        prev_pid = col_so_far[-1]
+                        score += self.compat.get_vertical_score(prev_pid, pid)
+                        count += 1
+                    
+                    avg_score = score / count
+                    new_beam.append((col_so_far + (pid,), used | {pid}, cum_score + avg_score))
+            
+            new_beam.sort(key=lambda x: x[2])
+            beam = new_beam[:beam_width]
+        
+        if not beam:
+            return board
+        
+        best_col = beam[0][0]
+        new_board = dict(board)
+        for r, pid in enumerate(best_col):
+            new_board[(r, target_col)] = pid
+        
+        return new_board
+
+    def _fix_boundary_pieces(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Fix boundary pieces by trying all possible assignments for boundary positions.
+        If the interior is mostly correct, this can fix edge misplacements.
+        """
+        from itertools import permutations
+        import heapq
+        
+        gs = self.grid_size
+        
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        # Step 1: Try Hungarian boundary assignment first
+        print("      Trying Hungarian boundary assignment...")
+        hungarian_board = self._hungarian_boundary_assignment(board)
+        hungarian_score = self.evaluate(hungarian_board)
+        if hungarian_score < best_score - 1e-9:
+            print(f"        Hungarian improved: {best_score:.4f} -> {hungarian_score:.4f}")
+            best_board = hungarian_board
+            best_score = hungarian_score
+        
+        board = best_board
+        
+        # Step 2: Fix individual columns and rows
+        # Fix first column
+        print("      Fixing first column...")
+        board = self._fix_column(board, 0)
+        
+        # Fix last column
+        print("      Fixing last column...")
+        board = self._fix_column(board, gs - 1)
+        
+        # Fix first row
+        print("      Fixing first row...")
+        board = self._fix_row(board, 0)
+        
+        # Fix last row
+        print("      Fixing last row...")
+        board = self._fix_row(board, gs - 1)
+        
+        # Step 3: Try swapping boundary pieces with any other pieces based on fit
+        print("      Trying boundary-to-any swaps...")
+        board = self._try_boundary_swaps_with_interior(board)
+        
+        # Step 4: Try fixing second row/column (often affected by boundary errors)
+        print("      Fixing second column...")
+        board = self._fix_column(board, 1)
+        print("      Fixing second-to-last column...")
+        board = self._fix_column(board, gs - 2)
+        print("      Fixing second row...")
+        board = self._fix_row(board, 1)
+        print("      Fixing second-to-last row...")
+        board = self._fix_row(board, gs - 2)
+        
+        # Step 5: Try aggressive reassignment using confident interior as anchors
+        print("      Trying aggressive boundary reassignment...")
+        board = self._reassign_boundary_from_all(board)
+        
+        # Step 6: Try permutations of worst-fitting pieces (8 worst)
+        print("      Fixing worst-fitting pieces...")
+        board = self._fix_worst_pieces(board, num_worst=8)
+        
+        # Step 7: Targeted swap search on remaining bad pieces
+        print("      Targeted swap search...")
+        board = self._targeted_swap_search(board)
+        
+        # One more global pass
+        board = self._final_global_swap_refinement(board)
+        
+        new_score = self.evaluate(board)
+        if new_score < best_score - 1e-9:
+            print(f"      Boundary fix improved: {best_score:.4f} -> {new_score:.4f}")
+            return board
+        return best_board
+    
+    def _fix_column(self, board: Dict[Tuple[int, int], int], col: int) -> Dict[Tuple[int, int], int]:
+        """Try all permutations of pieces in a single column."""
+        from itertools import permutations
+        
+        gs = self.grid_size
+        positions = [(r, col) for r in range(gs)]
+        pieces = [board[pos] for pos in positions]
+        
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        for perm in permutations(pieces):
+            candidate = dict(board)
+            for pos, pid in zip(positions, perm):
+                candidate[pos] = pid
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
+        
+        return best_board
+    
+    def _fix_row(self, board: Dict[Tuple[int, int], int], row: int) -> Dict[Tuple[int, int], int]:
+        """Try all permutations of pieces in a single row."""
+        from itertools import permutations
+        
+        gs = self.grid_size
+        positions = [(row, c) for c in range(gs)]
+        pieces = [board[pos] for pos in positions]
+        
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        for perm in permutations(pieces):
+            candidate = dict(board)
+            for pos, pid in zip(positions, perm):
+                candidate[pos] = pid
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
+        
+        return best_board
+
+    def _try_boundary_swaps_with_interior(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Try swapping each boundary piece with each interior piece.
+        This can fix cases where boundary and interior pieces are swapped.
+        """
+        gs = self.grid_size
+        
+        boundary_positions = set()
+        for r in range(gs):
+            boundary_positions.add((r, 0))
+            boundary_positions.add((r, gs - 1))
+        for c in range(gs):
+            boundary_positions.add((0, c))
+            boundary_positions.add((gs - 1, c))
+        
+        interior_positions = set((r, c) for r in range(gs) for c in range(gs)) - boundary_positions
+        
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        improved = True
+        while improved:
+            improved = False
+            for b_pos in boundary_positions:
+                for i_pos in interior_positions:
+                    candidate = dict(best_board)
+                    candidate[b_pos], candidate[i_pos] = candidate[i_pos], candidate[b_pos]
+                    
+                    score = self.evaluate(candidate)
+                    if score < best_score - 1e-9:
+                        best_score = score
+                        best_board = candidate
+                        improved = True
+        
+        return best_board
+
+    def _hungarian_boundary_assignment(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Use Hungarian algorithm to optimally assign pieces to boundary positions.
+        The interior is kept fixed, and we find the best assignment of remaining
+        pieces to boundary positions.
+        """
+        gs = self.grid_size
+        
+        # Define boundary positions (edges of the grid)
+        boundary_positions = []
+        # First row
+        for c in range(gs):
+            boundary_positions.append((0, c))
+        # Last row
+        for c in range(gs):
+            boundary_positions.append((gs - 1, c))
+        # First column (excluding corners already added)
+        for r in range(1, gs - 1):
+            boundary_positions.append((r, 0))
+        # Last column (excluding corners already added)
+        for r in range(1, gs - 1):
+            boundary_positions.append((r, gs - 1))
+        
+        boundary_positions = list(set(boundary_positions))  # Remove duplicates
+        interior_positions = [(r, c) for r in range(gs) for c in range(gs) 
+                              if (r, c) not in boundary_positions]
+        
+        # Get boundary pieces (pieces currently on boundary)
+        boundary_pieces = [board[pos] for pos in boundary_positions]
+        interior_pieces_set = set(board[pos] for pos in interior_positions)
+        
+        n_boundary = len(boundary_positions)
+        
+        # Build cost matrix: cost[i][j] = cost of placing boundary_pieces[j] at boundary_positions[i]
+        cost_matrix = np.zeros((n_boundary, n_boundary))
+        
+        for i, pos in enumerate(boundary_positions):
+            r, c = pos
+            for j, pid in enumerate(boundary_pieces):
+                cost = 0.0
+                count = 0
+                
+                # Check all 4 neighbors
+                neighbors = [
+                    (r - 1, c, 'top'),
+                    (r + 1, c, 'bottom'),
+                    (r, c - 1, 'left'),
+                    (r, c + 1, 'right')
+                ]
+                
+                for nr, nc, direction in neighbors:
+                    if 0 <= nr < gs and 0 <= nc < gs:
+                        neighbor_pos = (nr, nc)
+                        if neighbor_pos in interior_positions:
+                            # Interior is fixed, use its piece
+                            neighbor_pid = board[neighbor_pos]
+                            if direction == 'top':
+                                cost += self.compat.get_vertical_score(neighbor_pid, pid)
+                            elif direction == 'bottom':
+                                cost += self.compat.get_vertical_score(pid, neighbor_pid)
+                            elif direction == 'left':
+                                cost += self.compat.get_horizontal_score(neighbor_pid, pid)
+                            elif direction == 'right':
+                                cost += self.compat.get_horizontal_score(pid, neighbor_pid)
+                            count += 1
+                
+                cost_matrix[i][j] = cost / max(count, 1)
+        
+        # Solve assignment problem
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        # Build new board
+        new_board = dict(board)
+        for i, j in zip(row_ind, col_ind):
+            new_board[boundary_positions[i]] = boundary_pieces[j]
+        
+        return new_board
+
+    def _identify_confident_interior(self, board: Dict[Tuple[int, int], int]) -> Set[Tuple[int, int]]:
+        """
+        Identify interior positions where pieces are confidently placed.
+        These are positions where the piece has strong matches with ALL neighbors.
+        """
+        gs = self.grid_size
+        confident = set()
+        
+        for r in range(1, gs - 1):  # Exclude boundary
+            for c in range(1, gs - 1):
+                pid = board[(r, c)]
+                
+                # Check all 4 neighbors exist
+                total_score = 0.0
+                count = 0
+                
+                # Left
+                left_pid = board[(r, c - 1)]
+                total_score += self.compat.get_horizontal_score(left_pid, pid)
+                count += 1
+                
+                # Right
+                right_pid = board[(r, c + 1)]
+                total_score += self.compat.get_horizontal_score(pid, right_pid)
+                count += 1
+                
+                # Top
+                top_pid = board[(r - 1, c)]
+                total_score += self.compat.get_vertical_score(top_pid, pid)
+                count += 1
+                
+                # Bottom
+                bottom_pid = board[(r + 1, c)]
+                total_score += self.compat.get_vertical_score(pid, bottom_pid)
+                count += 1
+                
+                avg_score = total_score / count
+                
+                # If average score is very good, mark as confident
+                if avg_score < 0.10:  # Low score = good match
+                    confident.add((r, c))
+        
+        return confident
+
+    def _reassign_boundary_from_all(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        More aggressive boundary fix: identify the most confident interior pieces,
+        keep them fixed, and reassign ALL remaining pieces to fill the rest.
+        """
+        gs = self.grid_size
+        
+        # Find confidently placed interior pieces
+        confident = self._identify_confident_interior(board)
+        print(f"        Found {len(confident)} confidently placed interior pieces")
+        
+        if len(confident) < 20:  # Not enough confident placements
+            return board
+        
+        # Fixed positions are confident interior
+        fixed_positions = confident
+        fixed_pieces = {board[pos] for pos in fixed_positions}
+        
+        # Positions to reassign
+        reassign_positions = [(r, c) for r in range(gs) for c in range(gs) 
+                              if (r, c) not in fixed_positions]
+        reassign_pieces = [pid for pid in range(64) if pid not in fixed_pieces]
+        
+        n = len(reassign_positions)
+        if n != len(reassign_pieces):
+            return board  # Sanity check
+        
+        # Build cost matrix for reassignment
+        cost_matrix = np.zeros((n, n))
+        
+        for i, pos in enumerate(reassign_positions):
+            r, c = pos
+            for j, pid in enumerate(reassign_pieces):
+                cost = 0.0
+                count = 0
+                
+                neighbors = [
+                    (r - 1, c, 'top'),
+                    (r + 1, c, 'bottom'),
+                    (r, c - 1, 'left'),
+                    (r, c + 1, 'right')
+                ]
+                
+                for nr, nc, direction in neighbors:
+                    if 0 <= nr < gs and 0 <= nc < gs:
+                        neighbor_pos = (nr, nc)
+                        if neighbor_pos in fixed_positions:
+                            neighbor_pid = board[neighbor_pos]
+                            if direction == 'top':
+                                cost += self.compat.get_vertical_score(neighbor_pid, pid)
+                            elif direction == 'bottom':
+                                cost += self.compat.get_vertical_score(pid, neighbor_pid)
+                            elif direction == 'left':
+                                cost += self.compat.get_horizontal_score(neighbor_pid, pid)
+                            elif direction == 'right':
+                                cost += self.compat.get_horizontal_score(pid, neighbor_pid)
+                            count += 1
+                
+                cost_matrix[i][j] = cost / max(count, 1) if count > 0 else 1.0
+        
+        # Solve
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        # Build new board
+        new_board = dict(board)
+        for i, j in zip(row_ind, col_ind):
+            new_board[reassign_positions[i]] = reassign_pieces[j]
+        
+        new_score = self.evaluate(new_board)
+        old_score = self.evaluate(board)
+        
+        if new_score < old_score - 1e-9:
+            print(f"        Aggressive reassign improved: {old_score:.4f} -> {new_score:.4f}")
+            return new_board
+        return board
+
+    def _fix_worst_pieces(self, board: Dict[Tuple[int, int], int], num_worst: int = 16) -> Dict[Tuple[int, int], int]:
+        """
+        Find the worst-fitting pieces and try all permutations among them.
+        For num_worst=8, this is 8! = 40320 permutations (feasible).
+        """
+        from itertools import permutations
+        
+        gs = self.grid_size
+        
+        # Calculate local fit score for each piece
+        piece_scores = []
+        for r in range(gs):
+            for c in range(gs):
+                pid = board[(r, c)]
+                local_score = 0.0
+                count = 0
+                
+                if c > 0:
+                    local_score += self.compat.get_horizontal_score(board[(r, c-1)], pid)
+                    count += 1
+                if c < gs - 1:
+                    local_score += self.compat.get_horizontal_score(pid, board[(r, c+1)])
+                    count += 1
+                if r > 0:
+                    local_score += self.compat.get_vertical_score(board[(r-1, c)], pid)
+                    count += 1
+                if r < gs - 1:
+                    local_score += self.compat.get_vertical_score(pid, board[(r+1, c)])
+                    count += 1
+                
+                avg_score = local_score / max(count, 1)
+                piece_scores.append(((r, c), avg_score))
+        
+        # Sort by worst fit (highest score)
+        piece_scores.sort(key=lambda x: -x[1])
+        
+        # Take the worst num_worst pieces
+        worst_positions = [pos for pos, _ in piece_scores[:num_worst]]
+        worst_pieces = [board[pos] for pos in worst_positions]
+        
+        print(f"        Trying permutations of {num_worst} worst pieces...")
+        
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        count = 0
+        
+        for perm in permutations(worst_pieces):
+            count += 1
+            candidate = dict(board)
+            for pos, pid in zip(worst_positions, perm):
+                candidate[pos] = pid
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
+        
+        print(f"        Tried {count} permutations")
+        if best_score < self.evaluate(board) - 1e-9:
+            print(f"        Worst-piece permutation improved: {self.evaluate(board):.4f} -> {best_score:.4f}")
+        
+        return best_board
+
+    def _targeted_swap_search(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
+        """
+        Systematically try swapping each worst piece with every other piece.
+        More thorough than random sampling.
+        """
+        gs = self.grid_size
+        
+        # Find pieces with poor local fit
+        piece_scores = []
+        for r in range(gs):
+            for c in range(gs):
+                pid = board[(r, c)]
+                local_score = 0.0
+                count = 0
+                
+                if c > 0:
+                    local_score += self.compat.get_horizontal_score(board[(r, c-1)], pid)
+                    count += 1
+                if c < gs - 1:
+                    local_score += self.compat.get_horizontal_score(pid, board[(r, c+1)])
+                    count += 1
+                if r > 0:
+                    local_score += self.compat.get_vertical_score(board[(r-1, c)], pid)
+                    count += 1
+                if r < gs - 1:
+                    local_score += self.compat.get_vertical_score(pid, board[(r+1, c)])
+                    count += 1
+                
+                avg_score = local_score / max(count, 1)
+                piece_scores.append(((r, c), avg_score))
+        
+        # Sort by worst fit
+        piece_scores.sort(key=lambda x: -x[1])
+        
+        # Take worst 20 pieces as candidates for swapping
+        worst_positions = [pos for pos, _ in piece_scores[:20]]
+        all_positions = [(r, c) for r in range(gs) for c in range(gs)]
+        
+        best_board = dict(board)
+        best_score = self.evaluate(board)
+        
+        improved = True
+        while improved:
+            improved = False
+            for pos1 in worst_positions:
+                for pos2 in all_positions:
+                    if pos1 == pos2:
+                        continue
+                    
+                    candidate = dict(best_board)
+                    candidate[pos1], candidate[pos2] = candidate[pos2], candidate[pos1]
+                    
+                    score = self.evaluate(candidate)
+                    if score < best_score - 1e-9:
+                        best_score = score
+                        best_board = candidate
+                        improved = True
+        
+        return best_board
 
 
 # =============================================================================
