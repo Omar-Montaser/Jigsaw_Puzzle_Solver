@@ -426,7 +426,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     
     # Example usage - solve a 2x2 puzzle
-    test_image = "./Gravity Falls/puzzle_2x2/0.jpg"
+    test_image = "./Gravity Falls/puzzle_2x2/10.jpg"
     
     if os.path.exists(test_image):
         arrangement, score, solved = solve_image(

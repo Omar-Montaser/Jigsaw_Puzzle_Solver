@@ -323,6 +323,80 @@ def compute_gradient_cost(strips_a: dict, strips_b: dict, edge_a: str, edge_b: s
     return np.sqrt(grad_diff)
 
 
+def compute_vertical_asymmetry_penalty(strips_a: dict, strips_b: dict, 
+                                        edge_a: str, edge_b: str, N: int = 3) -> float:
+    """
+    Compute directional asymmetry penalty for VERTICAL seams only.
+    
+    For A (bottom) → B (top) placement:
+    - Compute the gradient trend WITHIN A approaching the seam
+    - Compute the gradient ACROSS the seam (A's bottom row → B's top row)
+    - Compute the gradient trend WITHIN B leaving the seam
+    - Penalize if the cross-seam gradient doesn't match the internal trends
+    
+    This is ASYMMETRIC: cost(A→B) ≠ cost(B→A) because the seam values differ.
+    
+    Args:
+        strips_a, strips_b: edge strips with 'gray' channel
+        edge_a, edge_b: edge identifiers
+        N: number of rows to compute gradient over
+        
+    Returns:
+        Penalty (0 if horizontal seam, positive if vertical with gradient mismatch)
+    """
+    # Only apply to vertical seams (A bottom → B top)
+    if not (edge_a == 'bottom' and edge_b == 'top'):
+        return 0.0
+    
+    gray_a = strips_a['gray']  # Shape: (strip_width, W)
+    gray_b = strips_b['gray']
+    
+    h_a = gray_a.shape[0]
+    h_b = gray_b.shape[0]
+    
+    # Get boundary values
+    boundary_a = np.mean(gray_a[-1, :])  # Bottom row of A
+    boundary_b = np.mean(gray_b[0, :])   # Top row of B
+    
+    # Gradient ACROSS the seam
+    grad_seam = boundary_b - boundary_a
+    
+    # Gradient trend WITHIN A (approaching seam from above)
+    # Positive = getting brighter going down
+    if h_a >= N + 1:
+        upper_a = np.mean(gray_a[-N-1, :])
+        lower_a = np.mean(gray_a[-1, :])
+        grad_a = (lower_a - upper_a) / N
+    else:
+        grad_a = (np.mean(gray_a[-1, :]) - np.mean(gray_a[0, :])) / max(h_a - 1, 1)
+    
+    # Gradient trend WITHIN B (leaving seam going down)
+    if h_b >= N + 1:
+        upper_b = np.mean(gray_b[0, :])
+        lower_b = np.mean(gray_b[N, :])
+        grad_b = (lower_b - upper_b) / N
+    else:
+        grad_b = (np.mean(gray_b[-1, :]) - np.mean(gray_b[0, :])) / max(h_b - 1, 1)
+    
+    # Predicted seam gradient based on internal trends
+    # If both pieces have consistent gradient, seam should follow
+    predicted_seam_grad = (grad_a + grad_b) / 2
+    
+    # Penalty: how much does actual seam gradient deviate from prediction?
+    # This is ASYMMETRIC because boundary_a and boundary_b values differ when pieces swap
+    seam_deviation = abs(grad_seam - predicted_seam_grad)
+    
+    # Also penalize sign reversal between internal gradient and seam gradient
+    sign_penalty = 0.0
+    avg_internal_grad = (grad_a + grad_b) / 2
+    if avg_internal_grad * grad_seam < 0 and abs(avg_internal_grad) > 1.0:
+        # Internal trend says one direction, seam goes opposite
+        sign_penalty = abs(grad_seam) * 0.3
+    
+    # Scale to be a weak tie-breaker (not dominant)
+    return seam_deviation * 0.1 + sign_penalty
+
+
 def seam_cost(artifacts: Dict[int, dict], A: int, edge_a: str, B: int, edge_b: str,
               weights: SeamCostWeights = None, strip_width: int = 10) -> float:
     """
@@ -364,27 +438,42 @@ def seam_cost(artifacts: Dict[int, dict], A: int, edge_a: str, B: int, edge_b: s
     edge_cost = compute_edge_cost(strips_a, strips_b, edge_a, edge_b)
     texture_cost = compute_texture_cost(strips_a, strips_b, edge_a, edge_b)
     
-    # Hierarchical combination: RGB primary + artifact regularization
+    # DIRECTIONAL ASYMMETRY: Vertical seam gradient penalty (tie-breaker)
+    # This breaks symmetry between (A above B) vs (B above A)
+    vertical_asymmetry = compute_vertical_asymmetry_penalty(strips_a, strips_b, edge_a, edge_b)
+    
+    # Hierarchical combination: RGB primary + artifact regularization + asymmetry
     total = (
         weights.rgb_weight * rgb_cost +
         weights.lowfreq_weight * lowfreq_cost +
         weights.edge_weight * edge_cost +
-        weights.texture_weight * texture_cost
+        weights.texture_weight * texture_cost +
+        vertical_asymmetry  # Weak additive penalty (not weighted)
     )
     
     return total
 
 
 def seam_cost_rgb_only_from_artifacts(artifacts: Dict[int, dict], A: int, edge_a: str, 
-                                       B: int, edge_b: str, strip_width: int = 10) -> float:
+                                       B: int, edge_b: str, strip_width: int = 10,
+                                       include_asymmetry: bool = True) -> float:
     """
     Compute RGB-only seam cost from artifacts (for beam search ranking).
     
     Uses EXACT legacy algorithm. This is the PRIMARY ranking signal.
+    Optionally includes directional asymmetry penalty for vertical seams.
     """
     strips_a = extract_edge_strip(artifacts[A], edge_a, strip_width)
     strips_b = extract_edge_strip(artifacts[B], edge_b, strip_width)
-    return compute_rgb_cost_legacy(strips_a, strips_b, edge_a, edge_b)
+    
+    rgb_cost = compute_rgb_cost_legacy(strips_a, strips_b, edge_a, edge_b)
+    
+    if include_asymmetry:
+        # Add directional asymmetry penalty for vertical seams
+        asymmetry = compute_vertical_asymmetry_penalty(strips_a, strips_b, edge_a, edge_b)
+        return rgb_cost + asymmetry
+    
+    return rgb_cost
 
 
 def seam_cost_with_regularization(artifacts: Dict[int, dict], A: int, edge_a: str,
