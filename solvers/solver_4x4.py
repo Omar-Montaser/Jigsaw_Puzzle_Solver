@@ -701,6 +701,187 @@ def score_board_with_global(artifacts: Dict[int, dict], match: dict,
             prior_weight * position_penalty)
 
 
+def precompute_border_likelihoods(artifacts: Dict[int, dict]) -> Dict[int, dict]:
+    """
+    Pre-compute border likelihood for all edges of all pieces.
+    
+    Called ONCE before beam search to identify likely border edges.
+    
+    Returns:
+        dict mapping piece_id -> {'top': score, 'bottom': score, 'left': score, 'right': score}
+    """
+    border_scores = {}
+    for pid, artifact in artifacts.items():
+        border_scores[pid] = compute_piece_border_likelihoods(artifact)
+    return border_scores
+
+
+def compute_early_border_penalty(border_scores: dict, board: dict, pid: int,
+                                  r: int, c: int, grid_size: int,
+                                  threshold: float = 0.4) -> float:
+    """
+    Compute border penalty for placing a piece at a position DURING beam search.
+    
+    This is a CONSTRAINT, not a feature. It prevents global shifts by:
+    1. HEAVILY penalizing border-like edges placed on internal seams
+    2. Rewarding border-like edges placed on actual puzzle boundaries
+    
+    Args:
+        border_scores: precomputed border likelihoods for all pieces
+        board: current partial board
+        pid: piece being placed
+        r, c: position being filled
+        grid_size: puzzle grid size
+        threshold: border likelihood threshold (lower = more sensitive)
+    
+    Returns:
+        Penalty to add to placement cost (higher = worse)
+    """
+    penalty = 0.0
+    scores = border_scores[pid]
+    
+    # Penalty multiplier - must be strong enough to override seam cost ties
+    INTERNAL_PENALTY = 50.0   # Heavy penalty for border edge on internal seam
+    BOUNDARY_REWARD = 20.0    # Reward for border edge on actual boundary
+    
+    # Check LEFT edge of this piece
+    if c > 0:
+        # This piece's left edge faces an internal seam (not puzzle border)
+        left_border_score = scores['left']
+        if left_border_score > threshold:
+            # High border likelihood on internal edge = BAD
+            penalty += (left_border_score - threshold) * INTERNAL_PENALTY
+        
+        # Also check right edge of left neighbor
+        left_neighbor_pid = board[(r, c - 1)]
+        right_border_score = border_scores[left_neighbor_pid]['right']
+        if right_border_score > threshold:
+            penalty += (right_border_score - threshold) * INTERNAL_PENALTY
+    else:
+        # c == 0: This piece's left edge IS on puzzle border
+        # Reward if it has high border likelihood
+        left_border_score = scores['left']
+        if left_border_score > threshold:
+            penalty -= (left_border_score - threshold) * BOUNDARY_REWARD
+        else:
+            # Penalize non-border edge on boundary (mild)
+            penalty += (threshold - left_border_score) * 5.0
+    
+    # Check TOP edge of this piece
+    if r > 0:
+        # This piece's top edge faces an internal seam
+        top_border_score = scores['top']
+        if top_border_score > threshold:
+            penalty += (top_border_score - threshold) * INTERNAL_PENALTY
+        
+        # Also check bottom edge of top neighbor
+        top_neighbor_pid = board[(r - 1, c)]
+        bottom_border_score = border_scores[top_neighbor_pid]['bottom']
+        if bottom_border_score > threshold:
+            penalty += (bottom_border_score - threshold) * INTERNAL_PENALTY
+    else:
+        # r == 0: This piece's top edge IS on puzzle border
+        top_border_score = scores['top']
+        if top_border_score > threshold:
+            penalty -= (top_border_score - threshold) * BOUNDARY_REWARD
+        else:
+            penalty += (threshold - top_border_score) * 5.0
+    
+    # Check if this piece is on RIGHT border (c == grid_size - 1)
+    if c == grid_size - 1:
+        right_border_score = scores['right']
+        if right_border_score > threshold:
+            penalty -= (right_border_score - threshold) * BOUNDARY_REWARD
+        else:
+            penalty += (threshold - right_border_score) * 5.0
+    
+    # Check if this piece is on BOTTOM border (r == grid_size - 1)
+    if r == grid_size - 1:
+        bottom_border_score = scores['bottom']
+        if bottom_border_score > threshold:
+            penalty -= (bottom_border_score - threshold) * BOUNDARY_REWARD
+        else:
+            penalty += (threshold - bottom_border_score) * 5.0
+    
+    return penalty
+
+
+def beam_solve_with_border_constraint(artifacts: Dict[int, dict], match: dict,
+                                       border_scores: dict,
+                                       beam_width: int = 20000, grid_size: int = 4,
+                                       border_penalty_weight: float = 1.0) -> Tuple[dict, float]:
+    """
+    Beam search with EARLY border constraint to prevent global shifts.
+    
+    Key difference from legacy: border penalties are applied DURING beam expansion,
+    not just at final evaluation. This prevents early commitment to shifted solutions.
+    
+    Args:
+        artifacts: piece artifacts
+        match: RGB-only match table (seam cost remains primary)
+        border_scores: precomputed border likelihoods
+        beam_width: number of partial solutions to keep
+        grid_size: puzzle grid size
+        border_penalty_weight: weight for border penalty (1.0 = equal to seam cost scale)
+    
+    Returns:
+        best_board, best_score
+    """
+    piece_ids = list(artifacts.keys())
+    
+    # State: (board_dict, used_set, cumulative_score)
+    initial_state = ({}, frozenset(), 0.0)
+    beam = [initial_state]
+    
+    positions = [(r, c) for r in range(grid_size) for c in range(grid_size)]
+    
+    for pos_idx, (r, c) in enumerate(positions):
+        next_beam = []
+        
+        for board, used, cum_score in beam:
+            for pid in piece_ids:
+                if pid in used:
+                    continue
+                
+                # PRIMARY: RGB seam cost (unchanged from legacy)
+                seam_cost = 0.0
+                if c > 0:
+                    left_pid = board[(r, c - 1)]
+                    seam_cost += match[left_pid][pid]['right']
+                if r > 0:
+                    top_pid = board[(r - 1, c)]
+                    seam_cost += match[top_pid][pid]['bottom']
+                
+                # EARLY GLOBAL CONSTRAINT: Border penalty
+                border_penalty = compute_early_border_penalty(
+                    border_scores, board, pid, r, c, grid_size
+                )
+                
+                # Combined placement cost (seam primary, border secondary)
+                placement_cost = seam_cost + border_penalty_weight * border_penalty
+                
+                new_board = board.copy()
+                new_board[(r, c)] = pid
+                new_used = used | {pid}
+                new_score = cum_score + placement_cost
+                
+                next_beam.append((new_board, new_used, new_score))
+        
+        # Sort by combined score (seam + border penalty)
+        next_beam.sort(key=lambda x: x[2])
+        beam = next_beam[:beam_width]
+        
+        if (pos_idx + 1) % grid_size == 0:
+            row_num = (pos_idx + 1) // grid_size
+            print(f"    Row {row_num}: {len(next_beam)} -> {len(beam)} states")
+    
+    best_board, _, best_score = beam[0]
+    
+    # Return RGB-only score for comparison (without border penalty)
+    rgb_score = score_board(match, best_board, grid_size)
+    return best_board, rgb_score
+
+
 def beam_solve_legacy(artifacts: Dict[int, dict], match: dict,
                       beam_width: int = 20000, grid_size: int = 4) -> Tuple[dict, float]:
     """
@@ -1062,23 +1243,32 @@ def solve_4x4(artifacts: Dict[int, dict], verbose: bool = True,
         print(f"Pieces: {len(artifacts)}")
         print(f"Hierarchy: RGB (ranking) -> Artifacts (regularization) -> Global (final)")
     
-    # Phase 1: Build RGB-only match table (matches legacy baseline)
+    # Phase 1: Build RGB-only match table + precompute border likelihoods
     if verbose:
-        print("\n[Phase 1] Building RGB-only match table (legacy baseline)...")
+        print("\n[Phase 1] Building match tables and border analysis...")
     
     match_rgb = build_match_table_rgb_only(artifacts)
+    border_scores = precompute_border_likelihoods(artifacts)
     
     if verbose:
         print("  RGB match table computed (16x16x2 = 512 scores)")
+        # Show border analysis summary
+        high_border_count = sum(
+            1 for pid in border_scores 
+            for edge in ['top', 'bottom', 'left', 'right']
+            if border_scores[pid][edge] > 0.5
+        )
+        print(f"  Border analysis: {high_border_count} high-likelihood border edges detected")
     
-    # Phase 2: Beam search with RGB-only ranking (legacy behavior)
+    # Phase 2: Beam search with EARLY border constraint
     if verbose:
-        print("\n[Phase 2] Beam search with RGB ranking (legacy behavior)...")
+        print("\n[Phase 2] Beam search with early border constraint...")
     
-    board, score = beam_solve_legacy(
-        artifacts, match_rgb, 
+    board, score = beam_solve_with_border_constraint(
+        artifacts, match_rgb, border_scores,
         beam_width=20000, 
-        grid_size=4
+        grid_size=4,
+        border_penalty_weight=1.0
     )
     
     if verbose:
@@ -1093,28 +1283,14 @@ def solve_4x4(artifacts: Dict[int, dict], verbose: bool = True,
         artifacts, match_rgb, match_full, board, grid_size=4, verbose=verbose
     )
     
-    # Phase 4: Refinement with global consistency (only on complete board)
-    if verbose:
-        print("\n[Phase 4] Refinement with global consistency...")
-    
-    board, score = multi_strategy_refinement(
-        artifacts, match_full, board, grid_size=4, 
-        verbose=verbose, use_global=True
-    )
+    # Phase 4: DISABLED - too slow, minimal benefit
+    # board, score = multi_strategy_refinement(...)
     
     # Report final scores
     rgb_score = score_board(match_rgb, board, grid_size=4)
-    full_score = score_board(match_full, board, grid_size=4)
-    border_penalty = compute_border_consistency_penalty(artifacts, board, grid_size=4)
-    global_penalty = compute_global_consistency_penalty(artifacts, board, grid_size=4)
-    position_penalty = compute_position_prior_penalty(artifacts, board, grid_size=4)
     
     if verbose:
-        print(f"  Final RGB score: {rgb_score:.4f}")
-        print(f"  Final regularized score: {full_score:.4f}")
-        print(f"  Border penalty: {border_penalty:.4f}")
-        print(f"  Global penalty: {global_penalty:.4f}")
-        print(f"  Position prior: {position_penalty:.4f}")
+        print(f"\n  Final RGB score: {rgb_score:.4f}")
     
     arrangement = board_to_arrangement(board, grid_size=4)
     
