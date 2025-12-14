@@ -624,7 +624,7 @@ if __name__ == "__main__":
                     else:
                         print(f"Difference: {correct_score - score:.4f}")
 
-        
+
         # Display results
         pieces, original = load_pieces_from_image(test_image, grid_size=4)
         
@@ -632,15 +632,15 @@ if __name__ == "__main__":
         axes[0].imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
         axes[0].set_title("Original (Shuffled)")
         axes[0].axis('off')
-        
+
         axes[1].imshow(cv2.cvtColor(solved, cv2.COLOR_BGR2RGB))
         axes[1].set_title(f"Solved (Score: {score:.4f})")
         axes[1].axis('off')
-        
+
         plt.tight_layout()
         plt.savefig("./debug/4x4_comparison.png", dpi=150)
         plt.show()
-        
+
         print(f"\nFinal arrangement: {arrangement}")
     else:
         print(f"Test image not found: {test_image}")

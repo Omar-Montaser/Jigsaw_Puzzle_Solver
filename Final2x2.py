@@ -1,10 +1,22 @@
 """
-2x2 Jigsaw Puzzle Solver
-========================
-Exact implementation as specified:
-- Phase 1: Edge compatibility using 1-pixel MAE only
-- Phase 2: Exhaustive search over all 24 permutations
-- Phase 3: Optional swap hillclimb refinement
+2x2 Jigsaw Puzzle Solver - LEGACY/BASELINE (RGB-Only)
+=====================================================
+
+WARNING: This is a LEGACY implementation using RGB-only matching.
+For production use, use the artifact-first pipeline instead:
+
+    from pipeline import solve_and_reconstruct
+    arr, score, img = solve_and_reconstruct("puzzle.jpg")
+
+This file is kept for:
+- Backward compatibility
+- Baseline comparison with artifact-first solver
+- Reference implementation
+
+Algorithm (RGB-only baseline):
+- SSD + NCC + continuity scoring on raw RGB pixels
+- Exhaustive search over all 24 permutations
+- Swap hillclimb refinement
 """
 
 import cv2
