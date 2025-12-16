@@ -22,4 +22,4 @@ from .seam_cost import (
 )
 from .solver_2x2 import solve_2x2
 from .solver_4x4 import solve_4x4
-from .solver_8x8 import solve_8x8
+from .solver_8x8 import solve_puzzle as solve_8x8

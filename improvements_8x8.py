@@ -3283,7 +3283,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         puzzle_path = sys.argv[1]
     else:
-        puzzle_path = "./Gravity Falls/puzzle_8x8/0.jpg"
+        puzzle_path = "./Gravity Falls/puzzle_8x8/10.jpg"
     
     config = SolverConfig(
         debug_dir="./debug",

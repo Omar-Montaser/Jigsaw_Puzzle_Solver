@@ -12,8 +12,7 @@ import cv2
 import tempfile
 import os
 
-from .improvements_8x8 import solve_puzzle, SolverConfig
-
+from .Improvements_8x8 import solve_puzzle, SolverConfig
 
 def solve_8x8(artifacts, verbose: bool = True) -> Tuple[Dict[Tuple[int, int], int], Tuple[int, ...], float]:
     """

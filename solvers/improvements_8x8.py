@@ -48,8 +48,8 @@ class SolverConfig:
     # Simulated annealing
     sa_t0: float = 0.15
     sa_alpha: float = 0.9995
-    sa_max_iters: int = 3000
-    sa_time_limit: float = 20.0  # seconds
+    sa_max_iters: int = 5000
+    sa_time_limit: float = 30.0  # seconds
     
     # Beam search fallback
     beam_seed_width: int = 200
@@ -785,48 +785,10 @@ class PuzzleAssembler:
                 piece_to_rows[int(pid)].append(idx)
 
         best_rows: Optional[List[Tuple[int, ...]]] = None
-        
-        # === DFS SAFETY GUARDS ===
-        DFS_TIME_LIMIT = 12.0        # Wall-clock seconds
-        DFS_NODE_LIMIT = 400_000     # Max recursive calls
-        PARTIAL_MIN_ROWS = 4         # Min rows to accept partial solution
-        
-        dfs_start_time = time.time()
-        dfs_nodes = [0]
-        dfs_aborted = [False]
-        abort_reason = [""]
-        
-        # Track best partial solution
-        best_partial_rows: List[Optional[List[Tuple[int, ...]]]] = [None]
-        best_partial_depth = [0]
-        best_partial_cost = [float('inf')]
 
-        def dfs(chosen: List[int], used_mask: int, cumulative_cost: float) -> bool:
+        def dfs(chosen: List[int], used_mask: int) -> bool:
             nonlocal best_rows
-            dfs_nodes[0] += 1
-            
-            # === GUARD 1: Node limit ===
-            if dfs_nodes[0] >= DFS_NODE_LIMIT:
-                dfs_aborted[0] = True
-                abort_reason[0] = f"node limit ({DFS_NODE_LIMIT})"
-                return False
-            
-            # === GUARD 2: Time limit (check periodically) ===
-            if dfs_nodes[0] % 2000 == 0:
-                if time.time() - dfs_start_time > DFS_TIME_LIMIT:
-                    dfs_aborted[0] = True
-                    abort_reason[0] = f"time limit ({DFS_TIME_LIMIT}s)"
-                    return False
-            
-            # === Track best partial solution ===
-            depth = len(chosen)
-            if depth > best_partial_depth[0] or (depth == best_partial_depth[0] and cumulative_cost < best_partial_cost[0]):
-                best_partial_depth[0] = depth
-                best_partial_cost[0] = cumulative_cost
-                best_partial_rows[0] = [row_entries[i][1] for i in chosen]
-            
-            # === Complete solution found ===
-            if depth == gs:
+            if len(chosen) == gs:
                 best_rows = [row_entries[i][1] for i in chosen]
                 return True
 
@@ -842,27 +804,16 @@ class PuzzleAssembler:
             options.sort(key=lambda ridx: row_entries[ridx][2])
 
             for ridx in options:
-                if dfs_aborted[0]:
-                    return False
-                mask, _, row_cost = row_entries[ridx]
+                mask, _, _ = row_entries[ridx]
                 if mask & used_mask:
                     continue
                 chosen.append(ridx)
-                if dfs(chosen, used_mask | mask, cumulative_cost + row_cost):
+                if dfs(chosen, used_mask | mask):
                     return True
                 chosen.pop()
             return False
 
-        found = dfs([], 0, 0.0)
-        
-        # === Report DFS result ===
-        elapsed = time.time() - dfs_start_time
-        if dfs_aborted[0]:
-            print(f"      DFS aborted: {abort_reason[0]} ({dfs_nodes[0]} nodes)")
-            print(f"      Best partial depth: {best_partial_depth[0]} rows")
-        else:
-            print(f"      DFS explored {dfs_nodes[0]} nodes in {elapsed:.2f}s")
-        
+        found = dfs([], 0)
         if not found or best_rows is None:
             print(f"    Warning: Could not select {gs} disjoint rows from top {max_pool}")
             self._hungarian_fell_back_to_beam = True
@@ -1191,7 +1142,7 @@ class PuzzleRefiner:
         print(f"  SA best score: {best_score:.4f}")
         return best_board
 
-    def random_pair_hillclimb(self, board: Dict[Tuple[int, int], int], max_iters: int = 80000) -> Dict[Tuple[int, int], int]:
+    def random_pair_hillclimb(self, board: Dict[Tuple[int, int], int], max_iters: int = 120000) -> Dict[Tuple[int, int], int]:
         """Fast approximation of the direct solver's swap refinement using delta scoring."""
         board = dict(board)
         total_edges = 2 * self.grid_size * (self.grid_size - 1)
@@ -1201,8 +1152,6 @@ class PuzzleRefiner:
         best_board = dict(board)
 
         positions = list(board.keys())
-        no_improve_count = 0
-        
         for it in range(max_iters):
             a, b = random.sample(positions, 2)
             delta_sum = self._swap_delta_sum(board, a, b)
@@ -1210,16 +1159,9 @@ class PuzzleRefiner:
                 board[a], board[b] = board[b], board[a]
                 current_sum += delta_sum
                 current_score = current_sum / max(total_edges, 1)
-                no_improve_count = 0
                 if current_score < best_score:
                     best_score = current_score
                     best_board = dict(board)
-            else:
-                no_improve_count += 1
-            
-            # Early termination if no improvement for a while
-            if no_improve_count > 15000:
-                break
 
             if it % 20000 == 0:
                 print(f"    Hillclimb {it}: current={current_score:.4f}, best={best_score:.4f}")
@@ -1276,7 +1218,7 @@ class PuzzleRefiner:
         print("\n  Starting refinement pipeline...")
 
         # Phase 1: Quick local improvement
-        board = self.local_swap_refinement(board, passes=self.config.refinement_passes, samples_per_pos=32)
+        board = self.local_swap_refinement(board, passes=self.config.refinement_passes, samples_per_pos=64)
         score = self.evaluate(board)
 
         # Phase 2: Hillclimb swaps (direct-solver style)
@@ -1776,7 +1718,6 @@ class AmbiguityClusterRefiner:
         """
         Try all permutations of entire rows.
         This addresses the "off by one row" error pattern.
-        Uses precomputed vertical costs for efficiency.
         """
         from itertools import permutations
         
@@ -1788,37 +1729,30 @@ class AmbiguityClusterRefiner:
             row = tuple(board[(r, c)] for c in range(gs))
             rows.append(row)
         
-        # Precompute vertical costs between all row pairs
-        # vert_cost[i][j] = cost of placing row i above row j
-        vert_cost = {}
-        for i in range(gs):
-            for j in range(gs):
-                if i != j:
-                    cost = sum(self.compat.get_vertical_score(rows[i][c], rows[j][c]) for c in range(gs))
-                    vert_cost[(i, j)] = cost / gs
-        
-        best_perm = tuple(range(gs))
-        best_cost = sum(vert_cost[(best_perm[i], best_perm[i+1])] for i in range(gs-1))
+        best_board = dict(board)
+        best_score = self.evaluate(board)
         
         # Try all row permutations (8! = 40320 for 8x8)
+        perm_count = 0
         for perm in permutations(range(gs)):
-            cost = sum(vert_cost[(perm[i], perm[i+1])] for i in range(gs-1))
-            if cost < best_cost - 1e-9:
-                best_cost = cost
-                best_perm = perm
-        
-        # Build best board
-        best_board = {}
-        for new_r, orig_r in enumerate(best_perm):
-            for c in range(gs):
-                best_board[(new_r, c)] = rows[orig_r][c]
+            perm_count += 1
+            
+            # Build candidate
+            candidate = {}
+            for new_r, orig_r in enumerate(perm):
+                for c in range(gs):
+                    candidate[(new_r, c)] = rows[orig_r][c]
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
         
         return best_board
     
     def _try_full_column_permutations(self, board: Dict[Tuple[int, int], int]) -> Dict[Tuple[int, int], int]:
         """
         Try all permutations of entire columns.
-        Uses precomputed horizontal costs for efficiency.
         """
         from itertools import permutations
         
@@ -1830,30 +1764,19 @@ class AmbiguityClusterRefiner:
             col = tuple(board[(r, c)] for r in range(gs))
             cols.append(col)
         
-        # Precompute horizontal costs between all column pairs
-        # horiz_cost[i][j] = cost of placing column i left of column j
-        horiz_cost = {}
-        for i in range(gs):
-            for j in range(gs):
-                if i != j:
-                    cost = sum(self.compat.get_horizontal_score(cols[i][r], cols[j][r]) for r in range(gs))
-                    horiz_cost[(i, j)] = cost / gs
+        best_board = dict(board)
+        best_score = self.evaluate(board)
         
-        best_perm = tuple(range(gs))
-        best_cost = sum(horiz_cost[(best_perm[i], best_perm[i+1])] for i in range(gs-1))
-        
-        # Try all column permutations
         for perm in permutations(range(gs)):
-            cost = sum(horiz_cost[(perm[i], perm[i+1])] for i in range(gs-1))
-            if cost < best_cost - 1e-9:
-                best_cost = cost
-                best_perm = perm
-        
-        # Build best board
-        best_board = {}
-        for new_c, orig_c in enumerate(best_perm):
-            for r in range(gs):
-                best_board[(r, new_c)] = cols[orig_c][r]
+            candidate = {}
+            for new_c, orig_c in enumerate(perm):
+                for r in range(gs):
+                    candidate[(r, new_c)] = cols[orig_c][r]
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
         
         return best_board
     
@@ -1973,7 +1896,7 @@ class AmbiguityClusterRefiner:
             def dfs(chosen, used_mask, cost):
                 nonlocal best_rows, best_cost
                 nodes[0] += 1
-                if nodes[0] > 300000:
+                if nodes[0] > 1000000:
                     return
                 
                 if len(chosen) == gs:
@@ -1998,13 +1921,13 @@ class AmbiguityClusterRefiner:
                            if pivot in r and not (m & used_mask)]
                 options.sort(key=lambda x: x[1])
                 
-                for ridx, _ in options[:150]:
+                for ridx, _ in options[:200]:
                     mask = row_entries[ridx][0]
                     score = row_entries[ridx][2]
                     chosen.append(ridx)
                     dfs(chosen, used_mask | mask, cost + score)
                     chosen.pop()
-                    if nodes[0] > 300000:
+                    if nodes[0] > 1000000:
                         return
             
             dfs([], 0, 0.0)
@@ -2058,15 +1981,16 @@ class AmbiguityClusterRefiner:
         best_board = board
         best_score = self.evaluate(board)
         
-        # Focus on corners only (reduced from 4 corners x 64 pieces = 256 to 4 x 16 = 64)
+        # Focus on corners and edges (where pieces have fewer constraints)
+        # These are more reliable starting points
         start_positions = [
             (0, 0), (0, gs-1), (gs-1, 0), (gs-1, gs-1),  # corners
         ]
         
         trials = 0
-        # For corners, try top 16 pieces (by border likelihood) as seeds
+        # For corners, try all 64 pieces as seeds
         for start_row, start_col in start_positions:
-            for seed_piece in all_pieces[:16]:  # Only try first 16 pieces
+            for seed_piece in all_pieces:
                 new_board = self._build_2d_from_seed(seed_piece, start_row, start_col, all_pieces)
                 trials += 1
                 
@@ -2691,102 +2615,48 @@ class AmbiguityClusterRefiner:
         return best_board
     
     def _fix_column(self, board: Dict[Tuple[int, int], int], col: int) -> Dict[Tuple[int, int], int]:
-        """Try all permutations of pieces in a single column using precomputed costs."""
+        """Try all permutations of pieces in a single column."""
         from itertools import permutations
         
         gs = self.grid_size
         positions = [(r, col) for r in range(gs)]
         pieces = [board[pos] for pos in positions]
         
-        # Get fixed neighbors (left and right columns)
-        left_neighbors = [board[(r, col-1)] if col > 0 else None for r in range(gs)]
-        right_neighbors = [board[(r, col+1)] if col < gs-1 else None for r in range(gs)]
-        
-        # Precompute costs for each piece at each row position
-        # cost[piece_idx][row] = cost of placing pieces[piece_idx] at row
-        piece_costs = {}
-        for pi, pid in enumerate(pieces):
-            for r in range(gs):
-                cost = 0.0
-                # Vertical neighbors
-                if r > 0:
-                    cost += self.compat.get_vertical_score(pieces[0], pid)  # placeholder, will use actual
-                if r < gs - 1:
-                    cost += self.compat.get_vertical_score(pid, pieces[0])  # placeholder
-                # Horizontal neighbors (fixed)
-                if left_neighbors[r] is not None:
-                    cost += self.compat.get_horizontal_score(left_neighbors[r], pid)
-                if right_neighbors[r] is not None:
-                    cost += self.compat.get_horizontal_score(pid, right_neighbors[r])
-                piece_costs[(pi, r)] = cost
-        
-        best_perm = tuple(range(len(pieces)))
-        best_cost = float('inf')
-        
-        for perm in permutations(range(len(pieces))):
-            # Cost = sum of vertical edges + horizontal edges to fixed neighbors
-            cost = 0.0
-            for r in range(gs):
-                pid = pieces[perm[r]]
-                # Horizontal to fixed neighbors
-                if left_neighbors[r] is not None:
-                    cost += self.compat.get_horizontal_score(left_neighbors[r], pid)
-                if right_neighbors[r] is not None:
-                    cost += self.compat.get_horizontal_score(pid, right_neighbors[r])
-                # Vertical to next piece in column
-                if r < gs - 1:
-                    next_pid = pieces[perm[r+1]]
-                    cost += self.compat.get_vertical_score(pid, next_pid)
-            
-            if cost < best_cost - 1e-9:
-                best_cost = cost
-                best_perm = perm
-        
-        # Build best board
         best_board = dict(board)
-        for r, pi in enumerate(best_perm):
-            best_board[(r, col)] = pieces[pi]
+        best_score = self.evaluate(board)
+        
+        for perm in permutations(pieces):
+            candidate = dict(board)
+            for pos, pid in zip(positions, perm):
+                candidate[pos] = pid
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
         
         return best_board
     
     def _fix_row(self, board: Dict[Tuple[int, int], int], row: int) -> Dict[Tuple[int, int], int]:
-        """Try all permutations of pieces in a single row using precomputed costs."""
+        """Try all permutations of pieces in a single row."""
         from itertools import permutations
         
         gs = self.grid_size
         positions = [(row, c) for c in range(gs)]
         pieces = [board[pos] for pos in positions]
         
-        # Get fixed neighbors (top and bottom rows)
-        top_neighbors = [board[(row-1, c)] if row > 0 else None for c in range(gs)]
-        bottom_neighbors = [board[(row+1, c)] if row < gs-1 else None for c in range(gs)]
-        
-        best_perm = tuple(range(len(pieces)))
-        best_cost = float('inf')
-        
-        for perm in permutations(range(len(pieces))):
-            # Cost = sum of horizontal edges + vertical edges to fixed neighbors
-            cost = 0.0
-            for c in range(gs):
-                pid = pieces[perm[c]]
-                # Vertical to fixed neighbors
-                if top_neighbors[c] is not None:
-                    cost += self.compat.get_vertical_score(top_neighbors[c], pid)
-                if bottom_neighbors[c] is not None:
-                    cost += self.compat.get_vertical_score(pid, bottom_neighbors[c])
-                # Horizontal to next piece in row
-                if c < gs - 1:
-                    next_pid = pieces[perm[c+1]]
-                    cost += self.compat.get_horizontal_score(pid, next_pid)
-            
-            if cost < best_cost - 1e-9:
-                best_cost = cost
-                best_perm = perm
-        
-        # Build best board
         best_board = dict(board)
-        for c, pi in enumerate(best_perm):
-            best_board[(row, c)] = pieces[pi]
+        best_score = self.evaluate(board)
+        
+        for perm in permutations(pieces):
+            candidate = dict(board)
+            for pos, pid in zip(positions, perm):
+                candidate[pos] = pid
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
         
         return best_board
 
@@ -3024,11 +2894,10 @@ class AmbiguityClusterRefiner:
             return new_board
         return board
 
-    def _fix_worst_pieces(self, board: Dict[Tuple[int, int], int], num_worst: int = 8) -> Dict[Tuple[int, int], int]:
+    def _fix_worst_pieces(self, board: Dict[Tuple[int, int], int], num_worst: int = 16) -> Dict[Tuple[int, int], int]:
         """
         Find the worst-fitting pieces and try all permutations among them.
         For num_worst=8, this is 8! = 40320 permutations (feasible).
-        Uses delta scoring for efficiency.
         """
         from itertools import permutations
         
@@ -3061,84 +2930,30 @@ class AmbiguityClusterRefiner:
         # Sort by worst fit (highest score)
         piece_scores.sort(key=lambda x: -x[1])
         
-        # Take the worst num_worst pieces (capped at 8 for performance)
-        num_worst = min(num_worst, 8)
+        # Take the worst num_worst pieces
         worst_positions = [pos for pos, _ in piece_scores[:num_worst]]
         worst_pieces = [board[pos] for pos in worst_positions]
         
-        # Precompute neighbor info for affected positions
-        fixed_neighbors = {}  # pos -> list of (neighbor_pos, direction)
-        for pos in worst_positions:
-            r, c = pos
-            neighbors = []
-            if c > 0 and (r, c-1) not in worst_positions:
-                neighbors.append(((r, c-1), 'left'))
-            if c < gs-1 and (r, c+1) not in worst_positions:
-                neighbors.append(((r, c+1), 'right'))
-            if r > 0 and (r-1, c) not in worst_positions:
-                neighbors.append(((r-1, c), 'top'))
-            if r < gs-1 and (r+1, c) not in worst_positions:
-                neighbors.append(((r+1, c), 'bottom'))
-            fixed_neighbors[pos] = neighbors
+        print(f"        Trying permutations of {num_worst} worst pieces...")
         
-        # Internal edges between worst positions
-        internal_edges = []
-        worst_set = set(worst_positions)
-        for i, pos1 in enumerate(worst_positions):
-            r1, c1 = pos1
-            for j, pos2 in enumerate(worst_positions):
-                if j <= i:
-                    continue
-                r2, c2 = pos2
-                if r1 == r2 and abs(c1 - c2) == 1:
-                    internal_edges.append((i, j, 'h', min(c1, c2)))
-                elif c1 == c2 and abs(r1 - r2) == 1:
-                    internal_edges.append((i, j, 'v', min(r1, r2)))
-        
-        best_perm = tuple(range(len(worst_pieces)))
-        best_cost = float('inf')
-        
-        for perm in permutations(range(len(worst_pieces))):
-            cost = 0.0
-            # Fixed neighbor costs
-            for i, pos in enumerate(worst_positions):
-                pid = worst_pieces[perm[i]]
-                for npos, direction in fixed_neighbors[pos]:
-                    npid = board[npos]
-                    if direction == 'left':
-                        cost += self.compat.get_horizontal_score(npid, pid)
-                    elif direction == 'right':
-                        cost += self.compat.get_horizontal_score(pid, npid)
-                    elif direction == 'top':
-                        cost += self.compat.get_vertical_score(npid, pid)
-                    elif direction == 'bottom':
-                        cost += self.compat.get_vertical_score(pid, npid)
-            
-            # Internal edge costs
-            for i, j, edge_type, _ in internal_edges:
-                pid_i = worst_pieces[perm[i]]
-                pid_j = worst_pieces[perm[j]]
-                r_i, c_i = worst_positions[i]
-                r_j, c_j = worst_positions[j]
-                if edge_type == 'h':
-                    if c_i < c_j:
-                        cost += self.compat.get_horizontal_score(pid_i, pid_j)
-                    else:
-                        cost += self.compat.get_horizontal_score(pid_j, pid_i)
-                else:
-                    if r_i < r_j:
-                        cost += self.compat.get_vertical_score(pid_i, pid_j)
-                    else:
-                        cost += self.compat.get_vertical_score(pid_j, pid_i)
-            
-            if cost < best_cost - 1e-9:
-                best_cost = cost
-                best_perm = perm
-        
-        # Build best board
         best_board = dict(board)
-        for i, pi in enumerate(best_perm):
-            best_board[worst_positions[i]] = worst_pieces[pi]
+        best_score = self.evaluate(board)
+        count = 0
+        
+        for perm in permutations(worst_pieces):
+            count += 1
+            candidate = dict(board)
+            for pos, pid in zip(worst_positions, perm):
+                candidate[pos] = pid
+            
+            score = self.evaluate(candidate)
+            if score < best_score - 1e-9:
+                best_score = score
+                best_board = candidate
+        
+        print(f"        Tried {count} permutations")
+        if best_score < self.evaluate(board) - 1e-9:
+            print(f"        Worst-piece permutation improved: {self.evaluate(board):.4f} -> {best_score:.4f}")
         
         return best_board
 
@@ -3468,7 +3283,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         puzzle_path = sys.argv[1]
     else:
-        puzzle_path = "./Gravity Falls/puzzle_8x8/0.jpg"
+        puzzle_path = "./Gravity Falls/puzzle_8x8/10.jpg"
     
     config = SolverConfig(
         debug_dir="./debug",
