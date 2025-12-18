@@ -14,10 +14,9 @@ All weights and thresholds configurable. Lower score = better match.
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, FrozenSet
-from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass
 from collections import defaultdict
-import matplotlib.pyplot as plt
 import time
 import heapq
 import random
@@ -30,46 +29,29 @@ from scipy.optimize import linear_sum_assignment
 
 @dataclass
 class SolverConfig:
-    """All configurable parameters."""
-    # Edge descriptor weights (must sum to 1.0)
-    # Pixel-only baseline (matches direct_pixel_solver.py behavior)
-    pixel_weight: float = 1.0
-    color_weight: float = 0.0
-    lbp_weight: float = 0.0
-    curv_weight: float = 0.0
-    centroid_weight: float = 0.0
-    
     # Confident pair thresholds
-    # Keep these conservative; locking is diagnostic-only in this file.
     margin_threshold: float = 0.50
     mutual_best_conf_ratio: float = 0.50
     very_confident_ratio: float = 0.10
-    
+
     # Simulated annealing
     sa_t0: float = 0.15
     sa_alpha: float = 0.9995
     sa_max_iters: int = 5000
     sa_time_limit: float = 30.0  # seconds
-    
+
     # Beam search fallback
     beam_seed_width: int = 200
-    
+
     # Acceptable score threshold
     acceptable_threshold: float = 0.12
-    
-    # Strip width for pixel extraction (1px = sharp edges, more works for some puzzles)
+
+    # Strip width for pixel extraction (1px = sharp edges)
     strip_width: int = 1
-    
-    # Histogram bins
-    color_bins: int = 16
-    lbp_bins: int = 8
-    
-    # Resampling length for signatures
-    resample_len: int = 128
-    
+
     # Refinement passes
     refinement_passes: int = 3
-    
+
     # Debug output
     debug_dir: str = "./debug"
     verbose: bool = True
@@ -106,29 +88,24 @@ def border_likelihood(edge_strip: np.ndarray) -> float:
 
 
 class EdgeDescriptors:
-    """Precomputed descriptors for a single edge."""
-    
+    """Precomputed descriptors for a single edge (pixel-based only)."""
+
     def __init__(self, piece: np.ndarray, edge: str, config: SolverConfig):
         self.edge = edge
         strip = self._get_strip(piece, edge, config.strip_width)
-        
-        # Compute all descriptors
+
+        # Compute pixel descriptor only
         self.pixel_strip = self._compute_pixel_strip(strip)
-        self.color_hist = self._compute_color_hist(strip, config.color_bins)
-        self.lbp_hist = self._compute_lbp_hist(strip, config.lbp_bins)
-        self.curvature = self._compute_curvature(strip, config.resample_len)
-        self.centroid_radial = self._compute_centroid_radial(strip, config.resample_len)
-        
-        # Compute border likelihood (how likely this edge is a TRUE puzzle border)
-        # Uses a 5-pixel strip at the edge boundary
+
+        # Compute border likelihood
         border_strip = self._get_border_strip(piece, edge, width=5)
         self.border_likelihood = border_likelihood(border_strip)
-    
+
     def _get_border_strip(self, piece: np.ndarray, edge: str, width: int = 5) -> np.ndarray:
         """Get a strip at the very edge of the piece for border detection."""
         h, w = piece.shape[:2]
-        width = min(width, h, w)  # Don't exceed piece dimensions
-        
+        width = min(width, h, w)
+
         if edge == 'top':
             return piece[:width, :, :] if len(piece.shape) == 3 else piece[:width, :]
         elif edge == 'bottom':
@@ -138,144 +115,24 @@ class EdgeDescriptors:
         elif edge == 'right':
             return piece[:, -width:, :] if len(piece.shape) == 3 else piece[:, -width:]
         return None
-    
+
     def _get_strip(self, piece: np.ndarray, edge: str, width: int) -> np.ndarray:
-        # IMPORTANT ORIENTATION RULE:
-        # For pixel-strip matching, we want the strip ordered as "boundary -> inward".
-        # This makes a 3-pixel strip comparable across complementary edges.
+        """Get edge strip ordered as boundary -> inward."""
         if edge == 'top':
-            # boundary is row 0, inward is increasing y
             return piece[:width, :, :] if len(piece.shape) == 3 else piece[:width, :]
         elif edge == 'bottom':
-            # boundary is last row, inward is decreasing y
             strip = piece[-width:, :, :] if len(piece.shape) == 3 else piece[-width:, :]
             return strip[::-1]
         elif edge == 'left':
-            # boundary is col 0, inward is increasing x
             return piece[:, :width, :] if len(piece.shape) == 3 else piece[:, :width]
         elif edge == 'right':
-            # boundary is last col, inward is decreasing x
             strip = piece[:, -width:, :] if len(piece.shape) == 3 else piece[:, -width:]
             return strip[:, ::-1]
         raise ValueError(f"Unknown edge: {edge}")
-    
+
     def _compute_pixel_strip(self, strip: np.ndarray) -> np.ndarray:
         """Flattened, normalized pixel values."""
-        pixels = strip.flatten().astype(np.float32) / 255.0
-        return pixels
-    
-    def _compute_color_hist(self, strip: np.ndarray, bins: int) -> np.ndarray:
-        """Color histogram, L1 normalized."""
-        if len(strip.shape) == 3:
-            hists = []
-            for c in range(strip.shape[2]):
-                h, _ = np.histogram(strip[:, :, c].flatten(), bins=bins, range=(0, 256))
-                hists.append(h)
-            hist = np.concatenate(hists).astype(np.float64)
-        else:
-            hist, _ = np.histogram(strip.flatten(), bins=bins, range=(0, 256))
-            hist = hist.astype(np.float64)
-        
-        total = np.sum(hist)
-        if total > 0:
-            hist /= total
-        return hist
-    
-    def _compute_lbp_hist(self, strip: np.ndarray, bins: int) -> np.ndarray:
-        """LBP histogram, L1 normalized."""
-        if len(strip.shape) == 3:
-            gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = strip.copy()
-        
-        if gray.shape[0] < 3 or gray.shape[1] < 3:
-            return np.zeros(bins)
-        
-        h, w = gray.shape
-        lbp_codes = []
-        
-        for y in range(1, h - 1):
-            for x in range(1, w - 1):
-                center = gray[y, x]
-                pattern = 0
-                neighbors = [
-                    (y-1, x-1), (y-1, x), (y-1, x+1),
-                    (y, x+1), (y+1, x+1), (y+1, x),
-                    (y+1, x-1), (y, x-1)
-                ]
-                for i, (ny, nx) in enumerate(neighbors):
-                    if gray[ny, nx] >= center:
-                        pattern |= (1 << i)
-                lbp_codes.append(bin(pattern).count('1') % bins)
-        
-        if not lbp_codes:
-            return np.zeros(bins)
-        
-        hist, _ = np.histogram(lbp_codes, bins=bins, range=(0, bins))
-        hist = hist.astype(np.float64)
-        total = np.sum(hist)
-        if total > 0:
-            hist /= total
-        return hist
-    
-    def _compute_curvature(self, strip: np.ndarray, resample_len: int) -> np.ndarray:
-        """Curvature signature (intensity-based proxy)."""
-        if len(strip.shape) == 3:
-            gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = strip.copy()
-        
-        h, w = gray.shape
-        if h > w:
-            profile = gray.mean(axis=1)
-        else:
-            profile = gray.mean(axis=0)
-        
-        if len(profile) < 3:
-            return np.zeros(resample_len)
-        
-        gradient = np.gradient(profile.astype(np.float64))
-        curvature = np.gradient(gradient)
-        curvature = self._resample(curvature, resample_len)
-        
-        norm = np.linalg.norm(curvature)
-        if norm > 1e-10:
-            curvature /= norm
-        return curvature
-    
-    def _compute_centroid_radial(self, strip: np.ndarray, resample_len: int) -> np.ndarray:
-        """Centroid-radial distance signature."""
-        if len(strip.shape) == 3:
-            h, w, _ = strip.shape
-        else:
-            h, w = strip.shape
-        
-        centroid = np.array([w / 2, h / 2])
-        
-        if h > w:
-            points = np.array([[w/2, y] for y in range(h)])
-        else:
-            points = np.array([[x, h/2] for x in range(w)])
-        
-        if len(points) == 0:
-            return np.zeros(resample_len)
-        
-        distances = np.linalg.norm(points - centroid, axis=1)
-        distances = self._resample(distances, resample_len)
-        
-        max_dist = np.max(distances)
-        if max_dist > 1e-10:
-            distances /= max_dist
-        return distances
-    
-    def _resample(self, signal: np.ndarray, target_len: int) -> np.ndarray:
-        if len(signal) == 0:
-            return np.zeros(target_len)
-        if len(signal) == target_len:
-            return signal
-        x_old = np.linspace(0, 1, len(signal))
-        x_new = np.linspace(0, 1, target_len)
-        return np.interp(x_new, x_old, signal)
+        return strip.flatten().astype(np.float32) / 255.0
 
 
 class CompatibilityMatrix:
@@ -314,6 +171,9 @@ class CompatibilityMatrix:
         
         # second_best_match[(pid, edge)] = (pid, edge, score)
         self.second_best: Dict[Tuple[int, str], Tuple[int, str, float]] = {}
+        
+        # Compute all compatibilities
+        self._compute_all()
         
     def _normalize_border_likelihoods(self):
         """Normalize border likelihood values to [0, 1] range."""
@@ -378,60 +238,14 @@ class CompatibilityMatrix:
             penalty += weight * (1.0 - right_likelihood) * 0.5
         
         return penalty
-        self._compute_all()
-    
-    def _chi_squared(self, h1: np.ndarray, h2: np.ndarray) -> float:
-        """Chi-squared distance between histograms."""
-        denom = h1 + h2
-        mask = denom > 1e-10
-        if not np.any(mask):
-            return 0.0
-        diff_sq = (h1[mask] - h2[mask]) ** 2
-        chi2 = np.sum(diff_sq / denom[mask])
-        return min(chi2 / 2.0, 1.0)
     
     def _compute_edge_score(self, desc1: EdgeDescriptors, desc2: EdgeDescriptors) -> float:
-        """Compute combined score between two edges (lower = better)."""
-        cfg = self.config
-        
-        # Pixel MAE
+        """Compute pixel MAE score between two edges (lower = better)."""
         p1, p2 = desc1.pixel_strip, desc2.pixel_strip
         min_len = min(len(p1), len(p2))
         if min_len > 0:
-            score_pixel = np.mean(np.abs(p1[:min_len] - p2[:min_len]))
-        else:
-            score_pixel = 1.0
-        
-        # Color histogram chi-squared
-        score_color = self._chi_squared(desc1.color_hist, desc2.color_hist)
-        
-        # LBP histogram chi-squared
-        score_lbp = self._chi_squared(desc1.lbp_hist, desc2.lbp_hist)
-        
-        # Curvature complementarity (reversed)
-        curv1 = desc1.curvature
-        curv2_rev = desc2.curvature[::-1]
-        curv_sum = curv1 + curv2_rev
-        score_curv = np.linalg.norm(curv_sum) / 2.0
-        score_curv = min(score_curv, 1.0)
-        
-        # Centroid radial (reversed)
-        rad1 = desc1.centroid_radial
-        rad2_rev = desc2.centroid_radial[::-1]
-        rad_diff = rad1 - rad2_rev
-        score_centroid = np.linalg.norm(rad_diff) / np.sqrt(len(rad1))
-        score_centroid = min(score_centroid, 1.0)
-        
-        # Combined score
-        combined = (
-            cfg.pixel_weight * score_pixel +
-            cfg.color_weight * score_color +
-            cfg.lbp_weight * score_lbp +
-            cfg.curv_weight * score_curv +
-            cfg.centroid_weight * score_centroid
-        )
-        
-        return combined
+            return float(np.mean(np.abs(p1[:min_len] - p2[:min_len])))
+        return 1.0
     
     def _compute_all(self):
         """Compute all pairwise edge compatibilities."""
@@ -468,6 +282,7 @@ class CompatibilityMatrix:
                 if count % 64 == 0:
                     print(f"    Progress: {count}/{total}")
     
+
     def get_score(self, pid_a: int, edge_a: str, pid_b: int, edge_b: str) -> float:
         """Get compatibility score."""
         key = (pid_a, edge_a, pid_b, edge_b)
@@ -671,14 +486,22 @@ class PuzzleAssembler:
         return seam_score + border_penalty_total
     
     def assemble_beam_search(self, beam_width: int = 10000) -> Dict[Tuple[int, int], int]:
-        """Beam search assembly."""
+        """Beam search assembly using accumulated edge cost."""
         import heapq
         piece_ids = self.compat.piece_ids
         n = len(piece_ids)
         
         print(f"  Beam search (width={beam_width})...")
         
+        # Dynamic beam width parameters
+        min_beam_width = 200
+        current_beam_width = beam_width
+        prev_best_avg_cost = None
+        consecutive_no_improvement = 0
+        improvement_threshold = 1e-4
+        
         # State: (arrangement tuple, used set, cum_score, num_edges)
+        # Score is pure accumulated edge cost (no heuristic)
         initial = (tuple([None] * n), frozenset(), 0.0, 0)
         beam = [initial]
         
@@ -706,6 +529,7 @@ class PuzzleAssembler:
                     
                     new_arr = list(arr)
                     new_arr[pos] = pid
+                    
                     new_beam.append((
                         tuple(new_arr),
                         used | {pid},
@@ -713,11 +537,37 @@ class PuzzleAssembler:
                         num_edges + edges
                     ))
             
+            # Score by average accumulated cost (lower = better)
+            def score(state):
+                arr, used, cost, num_edges = state
+                if num_edges == 0:
+                    return 0.0
+                return cost / num_edges
+            
             # Keep best (avoid full sort of potentially huge lists)
-            beam = heapq.nsmallest(beam_width, new_beam, key=lambda s: s[2] / max(s[3], 1))
+            beam = heapq.nsmallest(current_beam_width, new_beam, key=score)
+            
+            # Track best average edge score per depth for dynamic beam width
+            if beam and beam[0][3] > 0:
+                best_avg_cost = beam[0][2] / beam[0][3]
+                
+                if prev_best_avg_cost is not None:
+                    improvement = prev_best_avg_cost - best_avg_cost
+                    if improvement < improvement_threshold:
+                        consecutive_no_improvement += 1
+                    else:
+                        consecutive_no_improvement = 0
+                    
+                    # Shrink beam width if no improvement for 2 consecutive layers
+                    if consecutive_no_improvement >= 2 and current_beam_width > min_beam_width:
+                        current_beam_width = max(min_beam_width, current_beam_width // 2)
+                        consecutive_no_improvement = 0
+                        print(f"    Shrinking beam width to {current_beam_width}")
+                
+                prev_best_avg_cost = best_avg_cost
             
             if (pos + 1) % self.grid_size == 0:
-                print(f"    Row {(pos + 1) // self.grid_size}: {len(new_beam)} -> {len(beam)}")
+                print(f"    Row {(pos + 1) // self.grid_size}: {len(new_beam)} -> {len(beam)} (beam_width={current_beam_width})")
         
         # Convert to board
         best_arr = beam[0][0]
@@ -786,8 +636,29 @@ class PuzzleAssembler:
 
         best_rows: Optional[List[Tuple[int, ...]]] = None
 
+        # Bounded DFS parameters
+        max_depth = gs
+        max_expansions = 20000
+        time_limit_seconds = 10.0
+        expansions = [0]
+        start_time = time.time()
+        aborted = [False]
+
         def dfs(chosen: List[int], used_mask: int) -> bool:
             nonlocal best_rows
+            
+            # Check abort conditions
+            expansions[0] += 1
+            if expansions[0] > max_expansions:
+                aborted[0] = True
+                return False
+            if time.time() - start_time > time_limit_seconds:
+                aborted[0] = True
+                return False
+            if len(chosen) > max_depth:
+                aborted[0] = True
+                return False
+            
             if len(chosen) == gs:
                 best_rows = [row_entries[i][1] for i in chosen]
                 return True
@@ -804,6 +675,8 @@ class PuzzleAssembler:
             options.sort(key=lambda ridx: row_entries[ridx][2])
 
             for ridx in options:
+                if aborted[0]:
+                    return False
                 mask, _, _ = row_entries[ridx]
                 if mask & used_mask:
                     continue
@@ -811,9 +684,13 @@ class PuzzleAssembler:
                 if dfs(chosen, used_mask | mask):
                     return True
                 chosen.pop()
+                if aborted[0]:
+                    return False
             return False
 
         found = dfs([], 0)
+        if aborted[0]:
+            print(f"    DFS aborted (expansions={expansions[0]}, time={time.time()-start_time:.2f}s), falling back to beam search")
         if not found or best_rows is None:
             print(f"    Warning: Could not select {gs} disjoint rows from top {max_pool}")
             self._hungarian_fell_back_to_beam = True
@@ -821,7 +698,7 @@ class PuzzleAssembler:
 
         top_rows = best_rows
         
-        # Phase 3: Find optimal stacking order using Hungarian
+        # Phase 3: Find optimal stacking order using Hungarian========================================================================================================
         print("    Phase 3: Optimal row ordering...")
         
         # Cost matrix: cost[i][j] = cost of putting top_rows[i] in position j
@@ -1015,6 +892,12 @@ class PuzzleRefiner:
         
         print(f"  Local swap refinement (initial: {current_score:.4f})...")
         
+        # Early stopping parameters
+        best_score = current_score
+        iterations_without_improvement = 0
+        max_iterations_without_improvement = 5000
+        total_iterations = 0
+        
         positions = list(board.keys())
         
         for pass_num in range(passes):
@@ -1029,12 +912,28 @@ class PuzzleRefiner:
                         continue
 
                     delta = self._swap_delta_sum(board, pos1, pos2)
+                    total_iterations += 1
+                    
                     if delta < -1e-12:
                         board[pos1], board[pos2] = board[pos2], board[pos1]
                         current_sum += delta
                         current_score = current_sum / max(total_edges, 1)
                         improved = True
                         improvements += 1
+                        
+                        # Track best score for early stopping
+                        if current_score < best_score - 1e-9:
+                            best_score = current_score
+                            iterations_without_improvement = 0
+                        else:
+                            iterations_without_improvement += 1
+                    else:
+                        iterations_without_improvement += 1
+                    
+                    # Early stopping: no improvement after N iterations
+                    if iterations_without_improvement >= max_iterations_without_improvement:
+                        print(f"    Early stopping: no improvement after {max_iterations_without_improvement} iterations")
+                        return board
             
             print(f"    Pass {pass_num + 1}: score={current_score:.4f}, improvements={improvements}")
             
@@ -1081,6 +980,10 @@ class PuzzleRefiner:
         
         print(f"  Simulated annealing (initial: {current_score:.4f})...")
         
+        # Early stopping parameters
+        iterations_without_improvement = 0
+        max_iterations_without_improvement = 5000
+        
         T = cfg.sa_t0
         positions = list(board.keys())
         start_time = time.time()
@@ -1089,6 +992,11 @@ class PuzzleRefiner:
             # Check time limit
             if time.time() - start_time > cfg.sa_time_limit:
                 print(f"    Time limit reached at iteration {iteration}")
+                break
+            
+            # Early stopping: no improvement after N iterations
+            if iterations_without_improvement >= max_iterations_without_improvement:
+                print(f"    Early stopping: no improvement after {max_iterations_without_improvement} iterations (iter {iteration})")
                 break
             
             move_type = random.random()
@@ -1121,9 +1029,12 @@ class PuzzleRefiner:
                 current_score = new_score
                 if undo[0] == 'swap':
                     current_sum += delta_sum
-                if current_score < best_score:
+                if current_score < best_score - 1e-9:
                     best_score = current_score
                     best_board = dict(board)
+                    iterations_without_improvement = 0
+                else:
+                    iterations_without_improvement += 1
             else:
                 # Undo
                 if undo[0] == 'swap':
@@ -1132,6 +1043,7 @@ class PuzzleRefiner:
                 else:
                     _, a, b = undo
                     self._apply_block_swap_2x2(board, a, b)
+                iterations_without_improvement += 1
             
             # Cool down
             T *= cfg.sa_alpha
@@ -1151,17 +1063,31 @@ class PuzzleRefiner:
         best_score = current_score
         best_board = dict(board)
 
+        # Early stopping parameters
+        iterations_without_improvement = 0
+        max_iterations_without_improvement = 5000
+
         positions = list(board.keys())
         for it in range(max_iters):
+            # Early stopping: no improvement after N iterations
+            if iterations_without_improvement >= max_iterations_without_improvement:
+                print(f"    Early stopping: no improvement after {max_iterations_without_improvement} iterations (iter {it})")
+                break
+            
             a, b = random.sample(positions, 2)
             delta_sum = self._swap_delta_sum(board, a, b)
             if delta_sum < -1e-12:
                 board[a], board[b] = board[b], board[a]
                 current_sum += delta_sum
                 current_score = current_sum / max(total_edges, 1)
-                if current_score < best_score:
+                if current_score < best_score - 1e-9:
                     best_score = current_score
                     best_board = dict(board)
+                    iterations_without_improvement = 0
+                else:
+                    iterations_without_improvement += 1
+            else:
+                iterations_without_improvement += 1
 
             if it % 20000 == 0:
                 print(f"    Hillclimb {it}: current={current_score:.4f}, best={best_score:.4f}")
@@ -1220,14 +1146,24 @@ class PuzzleRefiner:
         # Phase 1: Quick local improvement
         board = self.local_swap_refinement(board, passes=self.config.refinement_passes, samples_per_pos=64)
         score = self.evaluate(board)
+        
+        # Skip remaining phases if score is already below acceptable threshold
+        if score <= self.config.acceptable_threshold:
+            print(f"  Score {score:.4f} already below threshold {self.config.acceptable_threshold}, skipping further refinement")
+            return board
 
         # Phase 2: Hillclimb swaps (direct-solver style)
         board = self.random_pair_hillclimb(board, max_iters=120000)
         score = self.evaluate(board)
+        
+        # Skip SA if score is already below acceptable threshold
+        if score <= self.config.acceptable_threshold:
+            print(f"  Score {score:.4f} already below threshold {self.config.acceptable_threshold}, skipping SA")
+            return board
 
         # Phase 3: SA as a last resort (kept time-bounded)
-        if score > self.config.acceptable_threshold:
-            board = self.simulated_annealing(board)
+        print(f"  Score {score:.4f} above threshold {self.config.acceptable_threshold}, running SA...")
+        board = self.simulated_annealing(board)
 
         final_score = self.evaluate(board)
         print(f"  Final score after refinement: {final_score:.4f}")
@@ -1348,8 +1284,6 @@ class AmbiguityClusterRefiner:
         For 8 rows with 8 possible shifts each, this is 8^8 = 16M combinations, which is too many.
         Instead, we use a greedy approach: fix one row and find best shifts for others.
         """
-        from itertools import product
-        
         gs = self.grid_size
         best_board = dict(board)
         best_score = self.evaluate(board)
@@ -1891,12 +1825,28 @@ class AmbiguityClusterRefiner:
             
             best_rows = None
             best_cost = float('inf')
-            nodes = [0]
+            
+            # Bounded DFS parameters
+            max_depth = gs
+            max_expansions = 20000
+            time_limit_seconds = 10.0
+            expansions = [0]
+            start_time = time.time()
+            aborted = [False]
             
             def dfs(chosen, used_mask, cost):
                 nonlocal best_rows, best_cost
-                nodes[0] += 1
-                if nodes[0] > 1000000:
+                
+                # Check abort conditions
+                expansions[0] += 1
+                if expansions[0] > max_expansions:
+                    aborted[0] = True
+                    return
+                if time.time() - start_time > time_limit_seconds:
+                    aborted[0] = True
+                    return
+                if len(chosen) > max_depth:
+                    aborted[0] = True
                     return
                 
                 if len(chosen) == gs:
@@ -1922,23 +1872,36 @@ class AmbiguityClusterRefiner:
                 options.sort(key=lambda x: x[1])
                 
                 for ridx, _ in options[:200]:
+                    if aborted[0]:
+                        return
                     mask = row_entries[ridx][0]
                     score = row_entries[ridx][2]
                     chosen.append(ridx)
                     dfs(chosen, used_mask | mask, cost + score)
                     chosen.pop()
-                    if nodes[0] > 1000000:
+                    if aborted[0]:
                         return
             
             dfs([], 0, 0.0)
-            print(f"      DFS explored {nodes[0]} nodes")
+            
+            if aborted[0]:
+                print(f"      DFS aborted (expansions={expansions[0]}, time={time.time()-start_time:.2f}s)")
+            else:
+                print(f"      DFS explored {expansions[0]} nodes")
             
             if best_rows:
                 selected_rows = best_rows
                 print(f"      Found {len(selected_rows)} disjoint rows")
             else:
-                print("      Failed to find 8 disjoint rows")
-                return board
+                print("      Failed to find 8 disjoint rows, using greedy result")
+                # Fall back to original board if we don't have enough rows
+                if len(selected_rows) < gs:
+                    return board
+        
+        # Ensure we have exactly gs rows before proceeding
+        if len(selected_rows) < gs:
+            print(f"      Only {len(selected_rows)} rows available, returning original board")
+            return board
         
         # Optimal row ordering
         def row_vertical_cost(row_top, row_bottom):
@@ -2380,7 +2343,7 @@ class AmbiguityClusterRefiner:
         
         # Try rebuilding first row using row 1 as anchor
         print("        Rebuilding first row...")
-        first_row_board = self._rebuild_row_from_anchor(best_board, 0, 1, boundary_pieces)
+        first_row_board = self._rebuild_row_from_anchor(best_board, 0, 1)
         first_row_score = self.evaluate(first_row_board)
         if first_row_score < best_score - 1e-9:
             best_score = first_row_score
@@ -2389,7 +2352,7 @@ class AmbiguityClusterRefiner:
         
         # Try rebuilding last row using row gs-2 as anchor
         print("        Rebuilding last row...")
-        last_row_board = self._rebuild_row_from_anchor(best_board, gs-1, gs-2, boundary_pieces)
+        last_row_board = self._rebuild_row_from_anchor(best_board, gs-1, gs-2)
         last_row_score = self.evaluate(last_row_board)
         if last_row_score < best_score - 1e-9:
             best_score = last_row_score
@@ -2398,7 +2361,7 @@ class AmbiguityClusterRefiner:
         
         # Try rebuilding first column using column 1 as anchor
         print("        Rebuilding first column...")
-        first_col_board = self._rebuild_col_from_anchor(best_board, 0, 1, boundary_pieces)
+        first_col_board = self._rebuild_col_from_anchor(best_board, 0, 1)
         first_col_score = self.evaluate(first_col_board)
         if first_col_score < best_score - 1e-9:
             best_score = first_col_score
@@ -2407,7 +2370,7 @@ class AmbiguityClusterRefiner:
         
         # Try rebuilding last column using column gs-2 as anchor
         print("        Rebuilding last column...")
-        last_col_board = self._rebuild_col_from_anchor(best_board, gs-1, gs-2, boundary_pieces)
+        last_col_board = self._rebuild_col_from_anchor(best_board, gs-1, gs-2)
         last_col_score = self.evaluate(last_col_board)
         if last_col_score < best_score - 1e-9:
             best_score = last_col_score
@@ -2416,12 +2379,11 @@ class AmbiguityClusterRefiner:
         
         return best_board
     
-    def _rebuild_row_from_anchor(self, board: Dict[Tuple[int, int], int], 
-                                  target_row: int, anchor_row: int,
-                                  available_pieces: List[int]) -> Dict[Tuple[int, int], int]:
+    def _rebuild_row_from_anchor(self, board: Dict[Tuple[int, int], int],
+                                  target_row: int, anchor_row: int) -> Dict[Tuple[int, int], int]:
         """Rebuild a row using the adjacent anchor row as a constraint."""
         gs = self.grid_size
-        
+
         # Get pieces currently in target row
         target_pieces = set(board[(target_row, c)] for c in range(gs))
         
@@ -2480,11 +2442,10 @@ class AmbiguityClusterRefiner:
         return new_board
     
     def _rebuild_col_from_anchor(self, board: Dict[Tuple[int, int], int],
-                                  target_col: int, anchor_col: int,
-                                  available_pieces: List[int]) -> Dict[Tuple[int, int], int]:
+                                  target_col: int, anchor_col: int) -> Dict[Tuple[int, int], int]:
         """Rebuild a column using the adjacent anchor column as a constraint."""
         gs = self.grid_size
-        
+
         # Get pieces currently in target column
         target_pieces = set(board[(r, target_col)] for r in range(gs))
         
@@ -3019,165 +2980,16 @@ class AmbiguityClusterRefiner:
 
 
 # =============================================================================
-# PHASE 4: DIAGNOSTICS & VISUALIZATION
-# =============================================================================
-
-class PuzzleDiagnostics:
-    """Diagnostics and visualization."""
-    
-    def __init__(self, pieces: Dict[int, np.ndarray], compat: CompatibilityMatrix,
-                 detector: ConfidentPairDetector, config: SolverConfig):
-        self.pieces = pieces
-        self.compat = compat
-        self.detector = detector
-        self.config = config
-        self.debug_dir = Path(config.debug_dir)
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
-    
-    def save_locked_pairs_matrix(self):
-        """Save locked pairs as a matrix heatmap."""
-        n = len(self.compat.piece_ids)
-        matrix = np.zeros((n, n))
-        
-        id_to_idx = {pid: i for i, pid in enumerate(sorted(self.compat.piece_ids))}
-        
-        for pair in self.detector.locked_pairs:
-            i, j = id_to_idx[pair.piece_a], id_to_idx[pair.piece_b]
-            matrix[i, j] = 1
-            matrix[j, i] = 1
-        
-        fig, ax = plt.subplots(figsize=(10, 10))
-        ax.imshow(matrix, cmap='Blues')
-        ax.set_title(f'Locked Pairs ({len(self.detector.locked_pairs)} pairs)')
-        ax.set_xlabel('Piece ID')
-        ax.set_ylabel('Piece ID')
-        
-        plt.tight_layout()
-        path = self.debug_dir / "locked_pairs_matrix.png"
-        plt.savefig(path, dpi=100)
-        plt.close()
-        print(f"  Saved: {path}")
-    
-    def save_compatibility_heatmap(self, edge_type: str = 'horizontal'):
-        """Save compatibility heatmap."""
-        n = len(self.compat.piece_ids)
-        pids = sorted(self.compat.piece_ids)
-        matrix = np.zeros((n, n))
-        
-        for i, pid_a in enumerate(pids):
-            for j, pid_b in enumerate(pids):
-                if pid_a == pid_b:
-                    matrix[i, j] = np.nan
-                else:
-                    if edge_type == 'horizontal':
-                        matrix[i, j] = self.compat.get_horizontal_score(pid_a, pid_b)
-                    else:
-                        matrix[i, j] = self.compat.get_vertical_score(pid_a, pid_b)
-        
-        fig, ax = plt.subplots(figsize=(12, 10))
-        im = ax.imshow(matrix, cmap='viridis_r')
-        plt.colorbar(im, ax=ax, label='Score (lower = better)')
-        
-        ax.set_title(f'Compatibility: {edge_type}')
-        ax.set_xlabel('Piece B')
-        ax.set_ylabel('Piece A')
-        
-        plt.tight_layout()
-        path = self.debug_dir / f"compatibility_{edge_type}.png"
-        plt.savefig(path, dpi=100)
-        plt.close()
-        print(f"  Saved: {path}")
-    
-    def save_confidence_histogram(self):
-        """Save confidence ratio histogram."""
-        ratios = [p.confidence_ratio for p in self.detector.locked_pairs]
-        margins = [p.margin for p in self.detector.locked_pairs]
-        
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
-        axes[0].hist(ratios, bins=30, edgecolor='black')
-        axes[0].set_xlabel('Confidence Ratio')
-        axes[0].set_ylabel('Count')
-        axes[0].set_title('Locked Pairs: Confidence Ratio Distribution')
-        
-        axes[1].hist(margins, bins=30, edgecolor='black')
-        axes[1].set_xlabel('Margin')
-        axes[1].set_ylabel('Count')
-        axes[1].set_title('Locked Pairs: Margin Distribution')
-        
-        plt.tight_layout()
-        path = self.debug_dir / "confidence_histogram.png"
-        plt.savefig(path, dpi=100)
-        plt.close()
-        print(f"  Saved: {path}")
-    
-    def save_solution_image(self, board: Dict[Tuple[int, int], int], 
-                            score: float, filename: str = "solution.png"):
-        """Save assembled puzzle image."""
-        gs = int(np.sqrt(len(board)))
-        first = self.pieces[0]
-        h, w = first.shape[:2]
-        is_color = len(first.shape) == 3
-        
-        if is_color:
-            assembled = np.zeros((h * gs, w * gs, 3), dtype=np.uint8)
-        else:
-            assembled = np.zeros((h * gs, w * gs), dtype=np.uint8)
-        
-        for (row, col), pid in board.items():
-            y1, y2 = row * h, (row + 1) * h
-            x1, x2 = col * w, (col + 1) * w
-            assembled[y1:y2, x1:x2] = self.pieces[pid]
-        
-        fig, ax = plt.subplots(figsize=(12, 12))
-        
-        if is_color:
-            ax.imshow(cv2.cvtColor(assembled, cv2.COLOR_BGR2RGB))
-        else:
-            ax.imshow(assembled, cmap='gray')
-        
-        ax.set_title(f'Solution (Score: {score:.4f})', fontsize=14, fontweight='bold')
-        
-        # Add piece labels
-        for (row, col), pid in board.items():
-            x_pos = col * w + w // 4
-            y_pos = row * h + h // 4
-            ax.text(x_pos, y_pos, f'{pid}', color='red', fontsize=6, fontweight='bold',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
-        
-        ax.axis('off')
-        plt.tight_layout()
-        
-        path = self.debug_dir / filename
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Saved: {path}")
-    
-    def run_all_diagnostics(self, board: Dict, score: float):
-        """Run all diagnostics."""
-        print("\n  Generating diagnostics...")
-        self.save_locked_pairs_matrix()
-        self.save_compatibility_heatmap('horizontal')
-        self.save_compatibility_heatmap('vertical')
-        self.save_confidence_histogram()
-        self.save_solution_image(board, score)
-
-
-# =============================================================================
 # MAIN SOLVER
 # =============================================================================
 
 def load_puzzle(puzzle_path: str) -> Tuple[Dict[int, np.ndarray], int]:
-    """Load puzzle pieces."""
     img = cv2.imread(puzzle_path, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError(f"Could not load: {puzzle_path}")
     
     h, w = img.shape[:2]
-    
-    for gs in [8, 4, 2]:
-        if h % gs == 0 and w % gs == 0:
-            break
+    gs = 8
     
     piece_h, piece_w = h // gs, w // gs
     
@@ -3193,89 +3005,120 @@ def load_puzzle(puzzle_path: str) -> Tuple[Dict[int, np.ndarray], int]:
     return pieces, gs
 
 
+def save_solution_image(pieces: Dict[int, np.ndarray], board: Dict[Tuple[int, int], int], 
+                        output_path: str, score: float = None):
+    """Save the assembled puzzle solution as an image."""
+    grid_size = int(np.sqrt(len(board)))
+    first_piece = pieces[0]
+    ph, pw = first_piece.shape[:2]
+    
+    # Assemble the image
+    if len(first_piece.shape) == 3:
+        assembled = np.zeros((ph * grid_size, pw * grid_size, 3), dtype=np.uint8)
+    else:
+        assembled = np.zeros((ph * grid_size, pw * grid_size), dtype=np.uint8)
+    
+    for (row, col), pid in board.items():
+        y1, y2 = row * ph, (row + 1) * ph
+        x1, x2 = col * pw, (col + 1) * pw
+        assembled[y1:y2, x1:x2] = pieces[pid]
+    
+    # Save the image
+    cv2.imwrite(output_path, assembled)
+    print(f"  Saved solution: {output_path}")
+
+
 def solve_puzzle(puzzle_path: str, config: Optional[SolverConfig] = None) -> Dict:
     """
     Main solving function with full pipeline.
+    
+    Pipeline:
+    - Phase 0: Load pieces, compute edge descriptors and compatibility matrix
+    - Phase 1: Detect confident pairs and build superpieces
+    - Phase 2: Initial assembly (Hungarian rows + beam search)
+    - Phase 3: Local refinement (swaps, simulated annealing)
+    - Phase 5: Ambiguity cluster permutation search
+    
+    Returns dict with 'board', 'arrangement', 'score', 'grid_size', 'time'.
     """
     if config is None:
         config = SolverConfig()
     
-    print("=" * 70)
-    print("IMPROVED 8x8 PUZZLE SOLVER")
-    print("=" * 70)
+    if config.verbose:
+        print("=" * 70)
+        print("8x8 PUZZLE SOLVER")
+        print("=" * 70)
     
     start_time = time.time()
     
-    # Load
-    print("\n[Phase 0] Loading and computing descriptors...")
+    # Phase 0: Load and compute descriptors
+    if config.verbose:
+        print("\n[Phase 0] Loading and computing descriptors...")
     pieces, grid_size = load_puzzle(puzzle_path)
-    print(f"  Loaded {len(pieces)} pieces ({grid_size}x{grid_size})")
+    if config.verbose:
+        print(f"  Loaded {len(pieces)} pieces ({grid_size}x{grid_size})")
     
     # Compatibility matrix
     compat = CompatibilityMatrix(pieces, config)
     
     # Phase 1: Confident pairs
-    print("\n[Phase 1] Detecting confident pairs...")
+    if config.verbose:
+        print("\n[Phase 1] Detecting confident pairs...")
     detector = ConfidentPairDetector(compat, config)
     detector.detect_pairs()
     detector.build_superpieces()
     
     # Phase 2: Assembly
-    print("\n[Phase 2] Assembling puzzle...")
+    if config.verbose:
+        print("\n[Phase 2] Assembling puzzle...")
     assembler = PuzzleAssembler(compat, detector, grid_size, config)
     board = assembler.assemble()
     assembly_score = assembler.evaluate_board(board)
-    print(f"  Assembly score: {assembly_score:.4f}")
+    if config.verbose:
+        print(f"  Assembly score: {assembly_score:.4f}")
     
     # Phase 3: Refinement
-    print("\n[Phase 3] Refining solution...")
+    if config.verbose:
+        print("\n[Phase 3] Refining solution...")
     refiner = PuzzleRefiner(compat, grid_size, config)
     board = refiner.refine(board)
-    phase3_score = refiner.evaluate(board)
     
     # Phase 5: Ambiguity Cluster Permutation Search
-    print("\n[Phase 5] Ambiguity cluster permutation search...")
+    if config.verbose:
+        print("\n[Phase 5] Ambiguity cluster permutation search...")
     cluster_refiner = AmbiguityClusterRefiner(compat, grid_size, config)
     board = cluster_refiner.refine(board)
     final_score = cluster_refiner.evaluate(board)
     
-    # Phase 4: Diagnostics
-    print("\n[Phase 4] Diagnostics...")
-    diagnostics = PuzzleDiagnostics(pieces, compat, detector, config)
-    diagnostics.run_all_diagnostics(board, final_score)
-    
-    # Final summary
     elapsed = time.time() - start_time
     
-    print("\n" + "=" * 70)
-    print("SOLUTION COMPLETE")
-    print("=" * 70)
-    print(f"Final Score: {final_score:.4f}")
-    print(f"Locked Pairs: {len(detector.locked_pairs)}")
-    print(f"Superpieces: {len(detector.superpieces)}")
-    print(f"Time: {elapsed:.1f}s")
-    
-    # Arrangement
+    # Build arrangement tuple
     arrangement = []
     for row in range(grid_size):
         for col in range(grid_size):
             arrangement.append(board[(row, col)])
-    print(f"Arrangement: {arrangement}")
+    
+    # Save solution image
+    debug_dir = Path(config.debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(debug_dir / "solution.png")
+    save_solution_image(pieces, board, output_path, final_score)
+    
+    if config.verbose:
+        print("\n" + "=" * 70)
+        print("SOLUTION COMPLETE")
+        print("=" * 70)
+        print(f"Final Score: {final_score:.4f}")
+        print(f"Time: {elapsed:.1f}s")
+        print(f"Arrangement: {arrangement}")
     
     return {
         'board': board,
         'arrangement': tuple(arrangement),
         'score': final_score,
         'grid_size': grid_size,
-        'locked_pairs': len(detector.locked_pairs),
-        'superpieces': len(detector.superpieces),
         'time': elapsed
     }
-
-
-# =============================================================================
-# CLI
-# =============================================================================
 
 if __name__ == "__main__":
     import sys
@@ -3283,7 +3126,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         puzzle_path = sys.argv[1]
     else:
-        puzzle_path = "./Gravity Falls/puzzle_8x8/10.jpg"
+        puzzle_path = "./Gravity Falls/puzzle_8x8/86.jpg"
     
     config = SolverConfig(
         debug_dir="./debug",

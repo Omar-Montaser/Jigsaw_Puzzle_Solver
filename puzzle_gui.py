@@ -252,6 +252,28 @@ class PuzzleSolverGUI:
         thread = threading.Thread(target=self._run_solver, daemon=True)
         thread.start()
     
+    def _find_correct_image(self, puzzle_path):
+        """Try to find the corresponding correct image for accuracy calculation."""
+        from pathlib import Path
+        puzzle_path = Path(puzzle_path)
+        
+        # Try common patterns: puzzle in puzzle_NxN folder, correct in correct folder
+        # e.g., "Gravity Falls/puzzle_8x8/0.jpg" -> "Gravity Falls/correct/0.png"
+        parent = puzzle_path.parent
+        filename_stem = puzzle_path.stem
+        
+        # Check if parent folder matches puzzle_NxN pattern
+        if parent.name.startswith('puzzle_'):
+            correct_folder = parent.parent / 'correct'
+            if correct_folder.exists():
+                # Try different extensions
+                for ext in ['.png', '.jpg', '.jpeg']:
+                    correct_path = correct_folder / (filename_stem + ext)
+                    if correct_path.exists():
+                        return str(correct_path)
+        
+        return None
+
     def _run_solver(self):
         try:
             old_stdout, old_stderr = sys.stdout, sys.stderr
@@ -261,15 +283,36 @@ class PuzzleSolverGUI:
             from pipeline import solve_and_reconstruct
             arrangement, score, solved_img = solve_and_reconstruct(self.image_path, verbose=True)
             
+            # Try to compute accuracy if correct image exists
+            accuracy = None
+            correct_path = self._find_correct_image(self.image_path)
+            if correct_path:
+                try:
+                    from accuracy_utils import (
+                        load_ground_truth,
+                        compute_pairwise_neighbor_accuracy,
+                        arrangement_to_grid,
+                    )
+                    # Detect grid size from arrangement length
+                    import math
+                    grid_size = int(math.sqrt(len(arrangement)))
+                    
+                    gt_labels = load_ground_truth(self.image_path, correct_path, grid_size)
+                    pred_grid = arrangement_to_grid(arrangement, grid_size)
+                    accuracy = compute_pairwise_neighbor_accuracy(pred_grid, gt_labels)
+                    print(f"\nAccuracy: {accuracy:.2%}")
+                except Exception as e:
+                    print(f"\nCould not compute accuracy: {e}")
+            
             sys.stdout, sys.stderr = old_stdout, old_stderr
             self.solved_image = solved_img
-            self.root.after(0, lambda: self._on_solve_complete(score))
+            self.root.after(0, lambda: self._on_solve_complete(score, accuracy))
             
         except Exception as e:
             sys.stdout, sys.stderr = old_stdout, old_stderr
             self.root.after(0, lambda: self._on_solve_error(str(e)))
     
-    def _on_solve_complete(self, score):
+    def _on_solve_complete(self, score, accuracy=None):
         self.progress.stop()
         self.select_btn.config(state=tk.NORMAL)
         self.solve_btn.config(state=tk.NORMAL)
@@ -277,15 +320,23 @@ class PuzzleSolverGUI:
         if self.solved_image is not None:
             self._display_image(self.solved_image)
         
-        threshold = 0.3
-        self._log(f"\nScore: {score:.4f}")
-        
-        if score < threshold:
-            self._log("✅ Puzzle Solved!")
-            self._set_status(f"✅ Puzzle Solved! (Score: {score:.4f})", COLORS['success'])
+        # Display accuracy if available, otherwise fall back to score
+        if accuracy is not None:
+            self._log(f"\nAccuracy: {accuracy:.2%}")
+            if accuracy >= 0.95:
+                self._log("✅ Puzzle Solved!")
+                self._set_status(f"✅ Puzzle Solved! (Accuracy: {accuracy:.2%})", COLORS['success'])
+            elif accuracy >= 0.70:
+                self._log("⚠ Partially solved")
+                self._set_status(f"⚠ Partially Solved (Accuracy: {accuracy:.2%})", COLORS['accent'])
+            else:
+                self._log("⚠ May need manual review")
+                self._set_status(f"⚠ Low Accuracy ({accuracy:.2%})", COLORS['error'])
         else:
-            self._log("⚠ May need manual review")
-            self._set_status(f"⚠ Completed (Score: {score:.4f})", COLORS['accent'])
+            # No correct image found, show score only
+            self._log(f"\nScore: {score:.4f}")
+            self._log("ℹ No correct image found for accuracy")
+            self._set_status(f"Completed (Score: {score:.4f})", COLORS['text_dim'])
     
     def _on_solve_error(self, error_msg):
         self.progress.stop()

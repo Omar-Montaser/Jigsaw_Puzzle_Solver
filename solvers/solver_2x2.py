@@ -1,14 +1,3 @@
-"""
-2x2 Puzzle Solver - RGB-Only Implementation
-
-Simple RGB-based matching for 2x2 puzzles.
-Uses SSD + NCC + continuity scoring on raw RGB pixels.
-
-Algorithm:
-- Exhaustive search over all 24 permutations
-- Border constraint to break ties on uniform backgrounds
-- Swap hillclimb refinement (rarely changes anything)
-"""
 
 import random
 import numpy as np

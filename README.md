@@ -116,7 +116,7 @@ solved = reconstruct_image(artifacts, board, grid_size)
 Image-Processing-Project/
 ├── puzzle_gui.py           # GUI application (Tkinter)
 ├── solve_puzzle.py         # CLI entry point
-├── improvements_8x8.py     # Advanced 8x8 solver (standalone)
+├── accuracy_utils.py       # Pairwise neighbor accuracy metrics
 │
 ├── core/                   # Core image processing utilities
 │   ├── __init__.py
@@ -139,10 +139,8 @@ Image-Processing-Project/
 │   ├── __init__.py
 │   ├── seam_cost.py        # Edge matching cost functions
 │   ├── solver_2x2.py       # 2×2 solver (exhaustive search)
-│   ├── solver_4x4.py       # 4×4 solver (beam search)
-│   ├── solver_8x8.py       # 8×8 solver wrapper
-│   ├── solver_8x8_heuristic.py  # Lightweight heuristic solver
-│   └── improvements_8x8.py # Full 8×8 solver implementation
+│   ├── solver_4x4.py       # 4×4 solver (beam search, ~0.6s)
+│   └── solver_8x8_final.py # 8×8 solver (LAB + A* region growing)
 │
 ├── visualization/          # Display and plotting utilities
 │   ├── __init__.py
@@ -213,27 +211,26 @@ Formula: `0.3 * sqrt(SSD) + 0.3 * NCC_cost + 0.4 * continuity * 10`
 
 ### 4×4 Solver (`solvers/solver_4x4.py`)
 
-- Beam search with width 20,000
+- Beam search with width 500 (optimized for speed)
 - RGB seams as primary signal
 - Border constraint during search
-- Global coherence as tie-breaker
-- Swap hillclimb refinement
+- Incremental delta scoring for fast hillclimb
+- Early termination when no improvements found
+- ~0.6s per puzzle, ~97% accuracy
 
-### 8×8 Solver (`improvements_8x8.py`)
+### 8×8 Solver (`solvers/solver_8x8_final.py`)
 
-Multi-phase approach:
-1. **Phase 0**: Precompute descriptors and pairwise compatibility
-2. **Phase 1**: Detect confident pairs via mutual best matching
-3. **Phase 2**: Hungarian row assembly + beam search
-4. **Phase 3**: Local swap refinement + simulated annealing
-5. **Phase 4**: Ambiguity cluster permutation search
-6. **Phase 5**: Boundary-specific refinement
+LAB color space + gradient dissimilarity approach:
+1. **Dissimilarity Matrices**: LAB color + NSSD + gradient continuity
+2. **Best Buddy Detection**: Mutual best-match pairs for confident anchors
+3. **A* Region Growing**: Priority-based placement from buddy seeds
+4. **Row-wise Greedy**: Alternative assembly from multiple starting pieces
+5. **Border Variance Scoring**: Orientation detection via edge variance
 
 Features:
-- DFS with node limits and timeout guards
-- Diverse row generation
-- 2D global construction
-- Targeted swap search for worst-fitting pieces
+- ~1.6s per puzzle, ~74% mean accuracy
+- Multiple candidate solutions with best selection
+- Buddy-prioritized placement reduces ambiguity
 
 ## Test Dataset
 
@@ -258,24 +255,15 @@ jupyter notebook
 # - test_8x8_batch_2.ipynb
 ```
 
-Accuracy is computed by comparing each piece position in the solved image against the ground truth using NCC (threshold 0.95).
+Accuracy is computed using **Pairwise Neighbor Accuracy** - the fraction of correct horizontal and vertical adjacency pairs in the solution.
 
-## Configuration
+## Performance
 
-The 8×8 solver supports extensive configuration via `SolverConfig`:
-
-```python
-from improvements_8x8 import solve_puzzle, SolverConfig
-
-config = SolverConfig(
-    verbose=True,           # Print progress
-    global_time_limit=150,  # Max solve time (seconds)
-    sa_max_iters=5000,      # Simulated annealing iterations
-    beam_seed_width=200,    # Beam search width
-)
-
-result = solve_puzzle("puzzle.jpg", config)
-```
+| Grid Size | Solver | Time/Image | Accuracy |
+|-----------|--------|------------|----------|
+| 2×2 | Exhaustive search | <0.1s | ~100% |
+| 4×4 | Beam search (width 500) | ~0.6s | ~97% |
+| 8×8 | LAB + A* region growing | ~1.6s | ~74% |
 
 ## Output Format
 
@@ -291,14 +279,13 @@ arrangement = [2, 0, 3, 1]
 score = 45.67
 ```
 
-## Debug Output
+## GUI Features
 
-The solver generates diagnostic images in `debug/`:
-- `locked_pairs_matrix.png`: Confident pair detection
-- `compatibility_horizontal.png`: Horizontal edge costs
-- `compatibility_vertical.png`: Vertical edge costs
-- `confidence_histogram.png`: Match confidence distribution
-- `solution.png`: Final solved puzzle
+The GUI application (`puzzle_gui.py`) provides:
+- File browser for selecting puzzle images
+- Real-time solving with progress display
+- Accuracy display (color-coded: green ≥95%, orange ≥70%, red <70%)
+- Automatic ground truth lookup from `correct/` folder
 
 ## Acknowledgments
 

@@ -147,10 +147,12 @@ def compute_coherence_penalty(artifacts: Dict[int, dict], board: dict, grid_size
 # =============================================================================
 
 def beam_search(artifacts: Dict[int, dict], match: dict, border_scores: dict,
-                beam_width: int = 20000, grid_size: int = 4) -> Tuple[dict, float]:
+                beam_width: int = 2000, grid_size: int = 4) -> Tuple[dict, float]:
     """
     Beam search with RGB seams (primary) and border constraint (structural).
     """
+    import heapq
+    
     piece_ids = list(artifacts.keys())
     beam = [({}, frozenset(), 0.0)]  # (board, used, score)
     positions = [(r, c) for r in range(grid_size) for c in range(grid_size)]
@@ -177,8 +179,8 @@ def beam_search(artifacts: Dict[int, dict], match: dict, border_scores: dict,
                 new_board[(r, c)] = pid
                 next_beam.append((new_board, used | {pid}, cum_score + seam_cost + border_penalty))
         
-        next_beam.sort(key=lambda x: x[2])
-        beam = next_beam[:beam_width]
+        # Use heapq.nsmallest for efficiency instead of full sort
+        beam = heapq.nsmallest(beam_width, next_beam, key=lambda x: x[2])
         
         if (pos_idx + 1) % grid_size == 0:
             print(f"    Row {(pos_idx + 1) // grid_size}: {len(next_beam)} -> {len(beam)} states")
@@ -190,34 +192,89 @@ def beam_search(artifacts: Dict[int, dict], match: dict, border_scores: dict,
 # REFINEMENT (simple swap hillclimb)
 # =============================================================================
 
+def compute_delta_score(match: dict, board: dict, p1: Tuple[int, int], p2: Tuple[int, int], grid_size: int) -> float:
+    """
+    Compute the change in score if we swap positions p1 and p2.
+    Only considers affected seams (much faster than full rescore).
+    """
+    r1, c1 = p1
+    r2, c2 = p2
+    pid1, pid2 = board[p1], board[p2]
+    
+    def seam_cost_at(r, c, pid):
+        """Cost of seams touching position (r,c) with piece pid."""
+        cost = 0.0
+        # Left seam
+        if c > 0:
+            cost += match[board[(r, c-1)]][pid]['right']
+        # Right seam
+        if c < grid_size - 1:
+            neighbor = board[(r, c+1)]
+            if (r, c+1) != p1 and (r, c+1) != p2:
+                cost += match[pid][neighbor]['right']
+        # Top seam
+        if r > 0:
+            cost += match[board[(r-1, c)]][pid]['bottom']
+        # Bottom seam
+        if r < grid_size - 1:
+            neighbor = board[(r+1, c)]
+            if (r+1, c) != p1 and (r+1, c) != p2:
+                cost += match[pid][neighbor]['bottom']
+        return cost
+    
+    # Current cost of affected seams
+    old_cost = seam_cost_at(r1, c1, pid1) + seam_cost_at(r2, c2, pid2)
+    
+    # Cost after swap
+    new_cost = seam_cost_at(r1, c1, pid2) + seam_cost_at(r2, c2, pid1)
+    
+    # Handle direct adjacency between p1 and p2
+    if abs(r1 - r2) + abs(c1 - c2) == 1:
+        if c2 == c1 + 1:  # p2 is right of p1
+            old_cost += match[pid1][pid2]['right']
+            new_cost += match[pid2][pid1]['right']
+        elif c1 == c2 + 1:  # p1 is right of p2
+            old_cost += match[pid2][pid1]['right']
+            new_cost += match[pid1][pid2]['right']
+        elif r2 == r1 + 1:  # p2 is below p1
+            old_cost += match[pid1][pid2]['bottom']
+            new_cost += match[pid2][pid1]['bottom']
+        elif r1 == r2 + 1:  # p1 is below p2
+            old_cost += match[pid2][pid1]['bottom']
+            new_cost += match[pid1][pid2]['bottom']
+    
+    return new_cost - old_cost
+
+
 def swap_hillclimb(artifacts: Dict[int, dict], match: dict, board: dict,
-                   grid_size: int = 4, max_iter: int = 5000) -> Tuple[dict, float]:
-    """Simple swap hillclimb with coherence penalty as tie-breaker."""
+                   grid_size: int = 4, max_iter: int = 1000) -> Tuple[dict, float]:
+    """Simple swap hillclimb using incremental scoring (fast)."""
     current = board.copy()
-    base_score = score_board(match, current, grid_size)
-    coherence = compute_coherence_penalty(artifacts, current, grid_size)
-    current_score = base_score + 0.1 * coherence
+    current_score = score_board(match, current, grid_size)
     
     positions = [(r, c) for r in range(grid_size) for c in range(grid_size)]
     improvements = 0
+    no_improve_count = 0
     
     for _ in range(max_iter):
         p1, p2 = random.sample(positions, 2)
-        current[p1], current[p2] = current[p2], current[p1]
         
-        new_base = score_board(match, current, grid_size)
-        new_coherence = compute_coherence_penalty(artifacts, current, grid_size)
-        new_score = new_base + 0.1 * new_coherence
+        # Fast incremental delta computation
+        delta = compute_delta_score(match, current, p1, p2, grid_size)
         
-        if new_score < current_score:
-            current_score = new_score
-            base_score = new_base
-            improvements += 1
-        else:
+        if delta < -0.01:  # Small threshold to avoid floating point noise
             current[p1], current[p2] = current[p2], current[p1]
+            current_score += delta
+            improvements += 1
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+            # Early termination if stuck
+            if no_improve_count > 200:
+                break
     
     print(f"    Hillclimb: {improvements} improvements")
-    return current, base_score
+    return current, current_score
 
 
 # =============================================================================
@@ -249,7 +306,7 @@ def solve_4x4(artifacts: Dict[int, dict], verbose: bool = True) -> Tuple[dict, l
     # Beam search
     if verbose:
         print("\n[2] Beam search (RGB + border constraint)...")
-    board, score = beam_search(artifacts, match, border_scores, beam_width=20000, grid_size=4)
+    board, score = beam_search(artifacts, match, border_scores, beam_width=500, grid_size=4)
     if verbose:
         print(f"    Score: {score:.2f}")
     

@@ -27,8 +27,8 @@ def solve_puzzle(artifacts: Dict[int, dict], grid_size: int,
     
     Args:
         artifacts: Dict of piece artifacts (MANDATORY)
-                   Each must contain: 'rgb', 'gray', 'edges'
-        grid_size: Size of the puzzle grid
+                   Each must contain: 'rgb', 'gray', 'edges', 'blur'
+        grid_size: Size of the puzzle grid (2, 4, or 8)
         verbose: Print progress info
     
     Returns:
@@ -50,8 +50,8 @@ def solve_puzzle(artifacts: Dict[int, dict], grid_size: int,
         return solve_4x4(artifacts, verbose=verbose)
     
     elif grid_size == 8:
-        from solvers.solver_8x8 import solve_8x8
-        return solve_8x8(artifacts, verbose=verbose)
+        from solvers.solver_8x8_final import solve_8x8_final
+        return solve_8x8_final(artifacts, verbose=verbose)
     
     else:
         raise ValueError(f"Unsupported grid size: {grid_size}")
@@ -139,7 +139,7 @@ def solve_and_reconstruct(image_path: str, output_path: Optional[str] = None,
     # Phase 2: Solve using artifacts
     if verbose:
         print("\n" + "=" * 60)
-        print("PHASE 2: Puzzle Solving (Artifact-First)")
+        print("PHASE 2: Puzzle Solving")
         print("=" * 60)
     
     board, arrangement, score = solve_puzzle(artifacts, grid_size, verbose)
